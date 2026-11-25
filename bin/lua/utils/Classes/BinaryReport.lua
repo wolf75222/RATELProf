@@ -70,6 +70,11 @@ local function decode_rprof(rprof_rep)
     return data
 end
 
+function BinaryReport.read_file(report_file)
+    check_report_file(report_file)
+    return decode_rprof(report_file)
+end
+
 local function merge_cuda_nodes(report, rank_data)
     local by_uuid, next_node = {}, 1
     for _, item in ipairs(rank_data) do
@@ -131,8 +136,7 @@ function BinaryReport:new(rprof_rep_files, opt)
     self.rank_count = #rprof_rep_files
 
     for i, rprof_rep_file in ipairs(rprof_rep_files) do
-        check_report_file(rprof_rep_file)
-        local data = decode_rprof(rprof_rep_file)
+        local data = BinaryReport.read_file(rprof_rep_file)
 
         local mpi_rank = data.mpi_rank or -1
 

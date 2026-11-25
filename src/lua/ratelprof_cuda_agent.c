@@ -1,7 +1,9 @@
+#define _GNU_SOURCE
 #include <cuda.h>
 #include <lauxlib.h>
 #include <lua.h>
 
+#include <dlfcn.h>
 #include <stdio.h>
 
 static void string_field(lua_State *lua, const char *key, const char *value)
@@ -35,17 +37,20 @@ static int get_devices(lua_State *lua)
     if (status != CUDA_SUCCESS)
         return failure(lua, status);
 
+    typedef CUresult (CUDAAPI *uuid_query)(CUuuid *, CUdevice);
+    uuid_query get_uuid = (uuid_query)dlsym(RTLD_DEFAULT, "cuDeviceGetUuid_v2");
+    if (!get_uuid)
+        get_uuid = (uuid_query)dlsym(RTLD_DEFAULT, "cuDeviceGetUuid");
     lua_createtable(lua, count, 0);
     for (int i = 0; i < count; ++i) {
         CUdevice device;
         CUuuid uuid;
-        char name[256], arch[32], id[37];
+        char name[256], arch[32], id[37] = "";
         int major, minor, sms, warp;
         size_t memory;
 
         if ((status = cuDeviceGet(&device, i)) != CUDA_SUCCESS ||
             (status = cuDeviceGetName(name, sizeof(name), device)) != CUDA_SUCCESS ||
-            (status = cuDeviceGetUuid_v2(&uuid, device)) != CUDA_SUCCESS ||
             (status = cuDeviceTotalMem(&memory, device)) != CUDA_SUCCESS ||
             (status = cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device)) != CUDA_SUCCESS ||
             (status = cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device)) != CUDA_SUCCESS ||
@@ -53,9 +58,11 @@ static int get_devices(lua_State *lua)
             (status = cuDeviceGetAttribute(&warp, CU_DEVICE_ATTRIBUTE_WARP_SIZE, device)) != CUDA_SUCCESS)
             return failure(lua, status);
 
-        const unsigned char *b = (const unsigned char *)uuid.bytes;
-        snprintf(id, sizeof(id), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        if (get_uuid && get_uuid(&uuid, device) == CUDA_SUCCESS) {
+            const unsigned char *b = (const unsigned char *)uuid.bytes;
+            snprintf(id, sizeof(id), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                     b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        }
         snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
 
         lua_createtable(lua, 0, 7);

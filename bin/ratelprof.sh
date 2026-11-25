@@ -7,8 +7,9 @@ Usage: ratelprof [--help] <command> [options] [command args]
 
 Commands:
   profile       Run an application and capture its profile into a .rprof-rep file.
-  metrics       Collect or import hardware counters with Nsight Compute.
+  metrics       Collect or import hardware counters with Nsight Compute or nvprof.
   sample        Collect CUDA program counter and warp stall samples with CUPTI.
+  import-nvprof Read a legacy nvprof recording into a RATELProf trace report.
   stats         Generate statistics from an existing .rprof-rep file.
   analyze       Run optimization rules on a profile.
   breakdown     Break down CPU and GPU activity by rank, process and device.
@@ -61,7 +62,7 @@ case "$CMD" in
         display_help
         ;;
 
-    profile|stats|analyze|breakdown|visualize|inspect|export|summarize|sample)
+    profile|stats|analyze|breakdown|visualize|inspect|export|summarize|sample|import-nvprof)
         exec "$LUA_EXEC" "$LUA_DIR/$CMD.lua" "$@"
         ;;
 

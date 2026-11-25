@@ -7,9 +7,27 @@ local function fail(message)
 end
 
 local function process(arguments, options)
-    local lib = ratelprof.consts._LIBS_DIR.."libratelprof_cuda_pcsampling.so"
+    local modern = ratelprof.consts._LIBS_DIR.."libratelprof_cuda_pcsampling.so"
+    local legacy = ratelprof.consts._LIBS_DIR.."libratelprof_cuda_pcsampling_legacy.so"
+    if options.backend ~= "auto" and options.backend ~= "modern" and options.backend ~= "legacy" then
+        fail("--backend expects auto, modern or legacy.")
+    end
+    local arch
+    if options.arch then
+        arch = tonumber(options.arch:lower():match("^sm_(%d+)[af]?$"))
+        if not arch then fail("--arch expects a CUDA architecture such as sm_61.") end
+        if arch < 52 then fail("CUPTI PC sampling requires sm_52 or newer.") end
+        if arch < 70 and options.backend == "modern" then
+            fail("Use the legacy PC sampling backend for Maxwell and Pascal.")
+        end
+    end
+    local lib = modern
+    if options.backend == "legacy" or (options.backend == "auto" and
+        ((arch and arch < 70) or not ratelprof.fs.exists(modern))) then
+        lib = legacy
+    end
     if not ratelprof.fs.exists(lib) then
-        fail("PC sampling requires a CUDA build with the CUPTI PC sampling collector.")
+        fail("The requested CUPTI PC sampling backend is unavailable in this build. Use CUDA 10.2–12.x for the legacy backend.")
     end
 
     local period = tonumber(options.period)
@@ -76,6 +94,8 @@ script:set_execute_function(process)
 script:add_argument("application", false, false, "CUDA application to sample.")
 script:add_argument("application-args", true, true, "Arguments for the application.")
 script:add_option("output", "o", "FILE", "Write the samples as JSON.", true, "pcsamples.json")
+script:add_option("backend", nil, "NAME", "Choose auto, modern, or legacy (Maxwell sm_52+ and Pascal).", true, "auto")
+script:add_option("arch", nil, "SM", "Select the sampler for an architecture such as sm_61.", true)
 script:add_option("period", nil, "EXP", "Sample every 2^EXP cycles. CUPTI chooses a device default when omitted.", true)
 script:add_option("dump-cubins", nil, "DIR", "Save the loaded cubins from this sampling run.", true)
 script:execute(arg)

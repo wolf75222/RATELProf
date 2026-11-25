@@ -75,6 +75,10 @@ consts_helper.profile = {
             arg_required    = true,
             default         = cuda and "msgpack" or ratelprof.consts._DEFAULT_PLUGIN
         },
+        ['plugin-live'] = cuda and {
+            desc            = "Stream activity records to the custom library selected with --plugin.",
+            arg_required    = false,
+        } or nil,
         trace = {
             desc            = string.format([[ 
 
@@ -516,7 +520,8 @@ consts_helper.export = {
     opt = {
         type = {
             desc            = [[ 
-                Possible values are: json, arg-info.
+                Possible values are: json, arg-info, sectioned.
+                Sectioned output uses the fork's 1.2.0 layout, one report per input.
                 Export format type.]],
             sname           = "t",
             arg             = "<type>",

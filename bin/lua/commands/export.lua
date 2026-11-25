@@ -1,4 +1,5 @@
 local BinaryReport = require("utils.Classes.BinaryReport")
+local SectionedWriter = require("utils.SectionedWriter")
 local export = {}
 
 local function write_to_output_file(report_files, data, ext)
@@ -20,6 +21,15 @@ local function export_json(report_files)
     local json_data = ratelprof.utils.generate_json(data:to_json())
 
     write_to_output_file(report_files, json_data, ".json")
+end
+
+local function export_sectioned(report_files)
+    for _, input in ipairs(report_files) do
+        local report = BinaryReport.read_file(input)
+        local base = ratelprof.fs.remove_extension(input, ratelprof.consts._REPORT_EXT)
+        local output = SectionedWriter.write_normalized(report, base .. ".sectioned.rprof-rep")
+        Message:print("RPROF: Export written to '" .. output .. "'")
+    end
 end
 
 local function format_number(val)
@@ -91,6 +101,8 @@ function export.process_export(positional_args, opt)
         export_json(report_files)
     elseif export_type == "arg-info" then
         export_arg_info(report_files)
+    elseif export_type == "sectioned" then
+        export_sectioned(report_files)
     else
         Message:error("Unknown export type: "..export_type)
         os.exit(1)

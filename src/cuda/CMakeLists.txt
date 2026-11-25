@@ -2,17 +2,46 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "The CUDA profiler requires Linux")
 endif()
 
-if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.2)
-    message(FATAL_ERROR "Select CUDA 12.9, 13.0 or 13.1 with CUDAToolkit_ROOT")
-endif()
 find_package(Threads REQUIRED)
 find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
 find_program(RATELPROF_CLANG clang)
 option(RATELPROF_CUDA_FULL_HOST_WRAPPERS "Generate host wrappers from the installed SDK headers" ON)
 
-get_target_property(CUPTI_INCLUDE_DIRS CUDA::cupti INTERFACE_INCLUDE_DIRECTORIES)
-find_path(RATELPROF_CUPTI_META_DIR cupti_driver_cbid.h HINTS ${CUPTI_INCLUDE_DIRS}
-    "${CUDAToolkit_LIBRARY_ROOT}/extras/CUPTI/include" NO_DEFAULT_PATH REQUIRED)
+set(RATELPROF_CUPTI_ROOT "" CACHE PATH "Use a CUPTI package separate from the CUDA toolkit")
+if(RATELPROF_CUPTI_ROOT)
+    find_path(RATELPROF_CUPTI_OVERRIDE_INCLUDE cupti_activity.h PATHS "${RATELPROF_CUPTI_ROOT}"
+        PATH_SUFFIXES include extras/CUPTI/include NO_DEFAULT_PATH REQUIRED)
+    find_library(RATELPROF_CUPTI_OVERRIDE_LIBRARY cupti PATHS "${RATELPROF_CUPTI_ROOT}"
+        PATH_SUFFIXES lib64 lib extras/CUPTI/lib64 NO_DEFAULT_PATH REQUIRED)
+    add_library(ratelprof_cupti SHARED IMPORTED GLOBAL)
+    set_target_properties(ratelprof_cupti PROPERTIES
+        IMPORTED_LOCATION "${RATELPROF_CUPTI_OVERRIDE_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${RATELPROF_CUPTI_OVERRIDE_INCLUDE};${CUDAToolkit_INCLUDE_DIRS}")
+    set(CUPTI_TARGET ratelprof_cupti)
+    set(RATELPROF_CUPTI_META_DIR "${RATELPROF_CUPTI_OVERRIDE_INCLUDE}")
+else()
+    if(NOT TARGET CUDA::cupti)
+        message(FATAL_ERROR "CUPTI is required. Set RATELPROF_CUPTI_ROOT for a separate package.")
+    endif()
+    get_target_property(CUPTI_INCLUDE_DIRS CUDA::cupti INTERFACE_INCLUDE_DIRECTORIES)
+    find_path(RATELPROF_CUPTI_TOOLKIT_INCLUDE cupti_activity.h HINTS ${CUPTI_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS}
+        "${CUDAToolkit_LIBRARY_ROOT}/extras/CUPTI/include" NO_DEFAULT_PATH REQUIRED)
+    set(CUPTI_TARGET CUDA::cupti)
+    set(RATELPROF_CUPTI_META_DIR "${RATELPROF_CUPTI_TOOLKIT_INCLUDE}")
+endif()
+set(RATELPROF_CUPTI_TARGET ${CUPTI_TARGET} PARENT_SCOPE)
+set(RATELPROF_CUPTI_HEADERS "${RATELPROF_CUPTI_META_DIR}" PARENT_SCOPE)
+
+set(CUPTI_ACTIVITY_RECORDS "${CMAKE_CURRENT_BINARY_DIR}/cupti_activity_records.inc")
+set(CUPTI_ACTIVITY_HEADERS "${RATELPROF_CUPTI_META_DIR}/cupti_activity.h")
+if(EXISTS "${RATELPROF_CUPTI_META_DIR}/cupti_activity_deprecated.h")
+    list(APPEND CUPTI_ACTIVITY_HEADERS "${RATELPROF_CUPTI_META_DIR}/cupti_activity_deprecated.h")
+endif()
+add_custom_command(OUTPUT "${CUPTI_ACTIVITY_RECORDS}"
+    COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/generate_activity_records.py"
+        "${RATELPROF_CUPTI_META_DIR}" "${CUPTI_ACTIVITY_RECORDS}"
+    DEPENDS generate_activity_records.py ${CUPTI_ACTIVITY_HEADERS}
+    VERBATIM)
 
 set(CUPTI_ARGUMENT_TABLE "${CMAKE_CURRENT_BINARY_DIR}/cupti_arguments.inc")
 add_custom_command(OUTPUT "${CUPTI_ARGUMENT_TABLE}"
@@ -31,6 +60,7 @@ add_library(ratelprof_cuda SHARED
     cupti_arguments.cpp
     module_capture.cpp
     output_plugin.cpp
+    "${CUPTI_ACTIVITY_RECORDS}"
     "${CUPTI_ARGUMENT_TABLE}"
     "${MSGPACK_DIR}/msgpack.c"
     "${MSGPACK_DIR}/msgpack_ext.c"
@@ -39,7 +69,7 @@ target_compile_features(ratelprof_cuda PRIVATE cxx_std_17)
 target_compile_options(ratelprof_cuda PRIVATE -Wall -Wextra)
 target_include_directories(ratelprof_cuda PRIVATE "${MSGPACK_DIR}" "${PROJECT_SOURCE_DIR}/src/tools"
     "${CMAKE_CURRENT_BINARY_DIR}")
-target_link_libraries(ratelprof_cuda PRIVATE CUDA::cupti Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(ratelprof_cuda PRIVATE ${CUPTI_TARGET} Threads::Threads ${CMAKE_DL_LIBS})
 
 function(add_host_trace library)
     add_library(${library} SHARED host_wrappers.cpp ${ARGN})
@@ -88,7 +118,11 @@ if(RATELPROF_CUDA_CUBLAS)
         add_host_trace(ratelprof_cuda_cublas)
         target_compile_definitions(ratelprof_cuda_cublas PRIVATE RATELPROF_CUDA_CUBLAS)
         target_include_directories(ratelprof_cuda_cublas PRIVATE ${RATELPROF_CUBLAS_INCLUDE_DIR})
-        enable_host_signatures(ratelprof_cuda_cublas Cublas cublas cublas_v2.h cublasLt.h)
+        set(cublas_headers cublas_v2.h)
+        if(EXISTS "${RATELPROF_CUBLAS_INCLUDE_DIR}/cublasLt.h")
+            list(APPEND cublas_headers cublasLt.h)
+        endif()
+        enable_host_signatures(ratelprof_cuda_cublas Cublas cublas ${cublas_headers})
         target_compile_definitions(ratelprof_cuda PRIVATE RATELPROF_CUDA_CUBLAS)
         message(STATUS "CUDA backend: cuBLAS tracing enabled")
     endif()

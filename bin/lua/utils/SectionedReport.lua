@@ -1,4 +1,4 @@
--- Reader for the upstream pre-release .rprof-rep binary layout, version 1.1.1.
+-- Reader for upstream 1.1.1 and the fork's CUDA-aware 1.2.0.
 -- The header and reference counts are little-endian, as is this format's
 -- MessagePack dialect. An event ends with its size and a 0xc1 marker.
 local SectionedReport = { magic = "RATELProf\0" }
@@ -134,11 +134,12 @@ local function vector(input, size)
     return result
 end
 
-local function floating(bits, sign_bit, unit, max_exp, bias, remainder)
+local function floating(bits, sign_bit, unit, max_exp, bias, remainder, plain)
     local sign = bits >= sign_bit and -1 or 1
     local exponent = math.floor((bits % sign_bit) / unit)
     local fraction = (bits % unit + remainder) / unit
     if exponent == max_exp then
+        if plain then return fraction == 0 and sign * math.huge or 0 / 0 end
         if fraction ~= 0 then return "NaN" end
         return sign < 0 and "-Infinity" or "Infinity"
     end
@@ -146,26 +147,33 @@ local function floating(bits, sign_bit, unit, max_exp, bias, remainder)
     return sign * (1 + fraction) * 2^(exponent - bias)
 end
 
-local function argument(input, depth)
+local function argument(input, depth, strings)
     if depth > 64 then input:fail("argument nesting exceeds limit") end
     local tag = input:byte()
+    local plain = strings ~= nil
     if tag <= 127 then return tag end
     if tag >= 0xe0 then return tag - 256 end
-    if widths[tag] then return input:integer(widths[tag], false, true) end
-    if widths[tag - 4] then return input:integer(widths[tag - 4], true, true) end
+    if widths[tag] then return input:integer(widths[tag], false, not plain) end
+    if widths[tag - 4] then return input:integer(widths[tag - 4], true, not plain) end
     if tag == 0xc0 then return nil end
     if tag == 0xc2 or tag == 0xc3 then return tag == 0xc3 end
-    if tag == 0xca then return floating(input:le(4), 2^31, 2^23, 255, 127, 0) end
+    if tag == 0xc7 and plain then
+        local string_value = strings[input:uint()]
+        if string_value == nil then input:fail("missing string reference") end
+        return string_value
+    end
+    if tag == 0xca then return floating(input:le(4), 2^31, 2^23, 255, 127, 0, plain) end
     if tag == 0xcb then
         local lo, hi = input:le(4), input:le(4)
-        return floating(hi, 2^31, 2^20, 2047, 1023, lo / word)
+        return floating(hi, 2^31, 2^20, 2047, 1023, lo / word, plain)
     end
     if (tag >= 0xa0 and tag <= 0xbf) or str_widths[tag] then return input:str(tag) end
     local count = array_size(input, tag)
     if count then
         local arr = {}
         for i = 1, input:checked_count(count) do
-            arr[i] = {value = argument(input, depth + 1)}
+            local value = argument(input, depth + 1, strings)
+            arr[i] = not plain and {value = value} or value
         end
         return arr
     end
@@ -174,11 +182,12 @@ local function argument(input, depth)
     if count then
         local map = {}
         for _ = 1, input:checked_count(count, 2) do
-            local key = argument(input, depth + 1)
-            if type(key) ~= "string" and type(key) ~= "number" then
+            local key = argument(input, depth + 1, strings)
+            if type(key) ~= "string" and (type(key) ~= "number" or key ~= key) then
                 input:fail("unsupported argument map key")
             end
-            map[key] = {value = argument(input, depth + 1)}
+            local value = argument(input, depth + 1, strings)
+            map[key] = not plain and {value = value} or value
         end
         return map
     end
@@ -191,7 +200,8 @@ local function header(data)
     end
     local input = reader(data, #SectionedReport.magic + 1, #data, "header")
     local major, minor, patch = input:byte(), input:byte(), input:byte()
-    if major ~= 1 or minor ~= 1 or patch ~= 1 then
+    local named_domains = major == 1 and minor == 2 and patch == 0
+    if not named_domains and (major ~= 1 or minor ~= 1 or patch ~= 1) then
         input:fail(("unsupported sectioned report version %d.%d.%d"):format(major, minor, patch))
     end
     local header_size = input.pos - 1 + #sections * 16
@@ -212,7 +222,7 @@ local function header(data)
         if range[1] < last then input:fail("overlapping sections") end
         last = range[2]
     end
-    return result
+    return result, named_domains
 end
 
 local function globals(input)
@@ -248,6 +258,12 @@ local function reference(input, table, name)
     local value = table[input:uint()]
     if value == nil then input:fail("missing " .. name .. " reference") end
     return value
+end
+
+local function named_fields(input, strings)
+    local values = argument(input, 0, strings)
+    if type(values) ~= "table" then input:fail("expected field map") end
+    return values
 end
 
 -- Wire order of the GPU_SPEC section, as written by upstream's lsgpu.
@@ -303,7 +319,14 @@ local function decode_event(input, group, report, refs)
         event.corr_id = input:uint()
     end
 
-    if domain < 10 then
+    if refs.named_domains then
+        for key, value in pairs(named_fields(input, refs.strings)) do
+            if key == "start" or key == "dur" or key == "corr_id" then
+                input:fail("duplicate event prefix field")
+            end
+            event[key] = value
+        end
+    elseif domain < 10 then
         event.pid, event.tid = group.unit, group.subunit
         local api
         if domain == 8 or domain == 9 then
@@ -369,14 +392,14 @@ local function decode_event(input, group, report, refs)
     end
     input:done()
 
-    local key = "RATELPROF_DOMAIN_" .. (domains[domain] or domain)
+    local key = refs.named_domains and domain or ("RATELPROF_DOMAIN_" .. (domains[domain] or domain))
     local events = report.trace_events[key]
     if not events then events = {}; report.trace_events[key] = events end
     if events[id] then input:fail("duplicate event ID") end
     events[id] = event
 end
 
-local function groups(input)
+local function groups(input, names)
     local count = input:count(4)
     local result, ids = {}, {}
     for tree = 1, 2 do
@@ -386,7 +409,12 @@ local function groups(input)
                 local subunit = input:int()
                 for _ = 1, input:count(4) do
                     local domain, offset, events, id = input:uint(), input:uint(), input:uint(), input:uint()
-                    if not domains[domain] or (domain < 10) ~= (tree == 1) then input:fail("invalid group domain") end
+                    if names then
+                        domain = names[domain]
+                        if not domain or domain == "" then input:fail("missing group domain name") end
+                    elseif not domains[domain] or (domain < 10) ~= (tree == 1) then
+                        input:fail("invalid group domain")
+                    end
                     if id >= count or ids[id] then input:fail("invalid group ID") end
                     ids[id] = true
                     result[#result + 1] = {unit = unit, subunit = subunit, domain = domain, offset = offset, count = events}
@@ -433,10 +461,20 @@ local function events(input, group_list, report, refs)
 end
 
 function SectionedReport.decode(data)
-    local s = header(data)
+    local s, named_domains = header(data)
     local report = globals(s.GLOBAL)
     local refs = {}
     refs.strings = references(s.STRING, 1, function(r) return r:str() end)
+    if named_domains then
+        if report.hostname == "" then report.hostname = nil end
+        report.locations = named_fields(s.LOCATION, refs.strings)
+        s.LOCATION:done()
+        report.gpu_props = named_fields(s.GPU_SPEC, refs.strings)
+        s.GPU_SPEC:done()
+        refs.named_domains = true
+        events(s.EVENTS, groups(s.OFFSETS, refs.strings), report, refs)
+        return report
+    end
     local function str(r) return reference(r, refs.strings, "string") end
     refs.locations = references(s.LOCATION, 6, function(r)
         local address, base = r:uint(true), r:uint(true)

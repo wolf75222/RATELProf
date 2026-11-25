@@ -1,4 +1,4 @@
-"""Exercise the pre-release 1.1.1 reader without CUDA or ROCm."""
+"""Exercise upstream 1.1.1 and CUDA sectioned reports without CUDA or ROCm."""
 import shutil
 import struct
 import subprocess
@@ -105,6 +105,61 @@ class SectionedReportTest(unittest.TestCase):
             rejects(payload:sub(1, -2), "invalid EVENTS range")
             rejects(payload:sub(1, -2) .. "\\0", "missing event marker")
             rejects(payload:sub(1, 12) .. "\\2" .. payload:sub(14), "unsupported sectioned report version")
+        """)
+
+    def test_conversion_preserves_upstream_and_cuda_domains_and_metadata(self):
+        self.run_decoder(fixture(), """
+            local Writer = require("utils.SectionedWriter")
+            local upstream = Reader.decode(payload)
+            local report = {
+                mpi_rank = 2, experiment_start_epoch = upstream.experiment_start_epoch,
+                version = {1, 4, 0}, lifecycle = {100, 900, 1000},
+                main_data = {-1, "app", "-n", "2"}, node_id = {[0] = 1},
+                locations = {[45072] = {sfun = "launch", oFile = "app", offset = 32}},
+                gpu_props = {[1] = {
+                    backend = "cuda", node = 1, uuid = "GPU-12345678-1234-1234-1234-123456789abc",
+                    registers_per_block = 65536, compute_capability = "3.0",
+                }},
+                trace_events = {
+                    RATELPROF_DOMAIN_CUDA_RUNTIME = {[500] = {
+                        start = 120, dur = 42, phase = "MAIN_PHASE", corr_id = 0,
+                        pid = 500, tid = 501, return_address = 45072, name = "cudaLaunchKernel",
+                        args = {fraction = {type = "float", value = -1.25}, status = {type = "int", value = -32770}},
+                    }},
+                    RATELPROF_DOMAIN_KERNEL = {[2] = {
+                        start = 167, dur = 10, phase = "MAIN_PHASE", corr_id = 500,
+                        args = {kernel_name = "sample", gpu_id = 0, queue_id = 3, wgr = {8, 1, 1}},
+                    }},
+                    RATELPROF_DOMAIN_CUDA_FUTURE = {[9] = {
+                        start = 800, dur = 1, phase = "MAIN_PHASE", corr_id = 500,
+                        pid = 500, tid = 502, args = {ok = false, values = {}},
+                    }},
+                },
+            }
+            for i = 1, 300 do
+                report.trace_events.RATELPROF_DOMAIN_CUDA_FUTURE[9].args.values[i] = i
+            end
+
+            local function same(expected, actual)
+                assert(type(expected) == type(actual))
+                if type(expected) ~= "table" then
+                    assert(expected == actual, tostring(expected) .. " != " .. tostring(actual))
+                    return
+                end
+                for k, v in pairs(expected) do same(v, actual[k]) end
+                for k in pairs(actual) do assert(expected[k] ~= nil) end
+            end
+
+            for _, original in ipairs({upstream, report}) do
+                local path = arg[1] .. ".sectioned.rprof-rep"
+                assert(Writer.write_normalized(original, path) == path)
+                local output = assert(io.open(path, "rb"))
+                local encoded = output:read("*a")
+                output:close()
+                assert(encoded:sub(1, 13) == "RATELProf\\0" .. string.char(1, 2, 0))
+                same(original, Reader.decode(encoded))
+                assert(not pcall(Reader.decode, encoded:sub(1, -2)))
+            end
         """)
 
 

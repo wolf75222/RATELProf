@@ -25,42 +25,44 @@ def text_row(row, width):
 
 def metrics_table(path):
     report = read_json(path, "ratelprof.metrics.v1")
+    profiler = "nvprof" if report.get("profiler") == "nvprof" else "Nsight Compute"
+    launch_fields = (*LAUNCH_FIELDS, "Correlation ID") if profiler == "nvprof" else LAUNCH_FIELDS
     measurement = report.get("measurement")
     tables = report.get("tables")
     if not isinstance(tables, list) or not tables or not isinstance(measurement, dict):
-        raise ValueError("missing Nsight Compute tables or measurement metadata")
-    rows = [["Kernel Name", "Metric", "Unit", "Value", "Report Table", "Launch ID", *LAUNCH_FIELDS]]
+        raise ValueError(f"missing {profiler} tables or measurement metadata")
+    rows = [["Kernel Name", "Metric", "Unit", "Value", "Report Table", "Launch ID", *launch_fields]]
     for number, table in enumerate(tables, 1):
         if not isinstance(table, dict) or not isinstance(table.get("columns"), list):
-            raise ValueError(f"missing Nsight Compute headers in table {number}")
+            raise ValueError(f"missing {profiler} headers in table {number}")
         columns = table["columns"]
         if not text_row(columns, len(columns)) or not {"ID", "Kernel Name"}.issubset(columns):
-            raise ValueError(f"invalid Nsight Compute headers in table {number}")
+            raise ValueError(f"invalid {profiler} headers in table {number}")
         units = table.get("units")
         if units is None:
             units = [""] * len(columns)
         launches = table.get("rows")
         if not text_row(units, len(columns)) or not isinstance(launches, list):
-            raise ValueError(f"invalid Nsight Compute units or launches in table {number}")
+            raise ValueError(f"invalid {profiler} units or launches in table {number}")
         metrics = [(i, name, units[i]) for i, name in enumerate(columns)
-                   if name not in (*LAUNCH_FIELDS, "ID", "Kernel Name")]
+                   if name not in (*launch_fields, "ID", "Kernel Name")]
         for values in launches:
             if not text_row(values, len(columns)):
-                raise ValueError(f"invalid Nsight Compute launch in table {number}")
+                raise ValueError(f"invalid {profiler} launch in table {number}")
             launch = dict(zip(columns, values))
-            identity = [str(number), launch["ID"], *(launch.get(field, "") for field in LAUNCH_FIELDS)]
+            identity = [str(number), launch["ID"], *(launch.get(field, "") for field in launch_fields)]
             rows.extend([launch["Kernel Name"], metric, unit, values[i], *identity]
                         for i, metric, unit in metrics)
-    message = [f"Nsight Compute report {path.name}. Launch IDs refer to this report."]
+    message = [f"{profiler} report {path.name}. Launch IDs refer to this report."]
     replay = measurement.get("replay_mode")
     if replay:
         message.append(f"Collection used {replay} replay.")
     elif measurement.get("mode") == "import":
-        message.append("Imported from an existing Nsight Compute recording.")
+        message.append(f"Imported from an existing {profiler} recording.")
     if len(rows) == 1:
         message.append("This report contains no metric values.")
     return {"cuda_metrics": {
-        "NAME": "Nsight Compute", "TYPE": "Hardware Counters",
+        "NAME": profiler, "TYPE": "Hardware Counters",
         "DATA": rows if len(rows) > 1 else [], "MSG": "\n".join(message),
     }}
 

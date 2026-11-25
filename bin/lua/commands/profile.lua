@@ -47,6 +47,11 @@ local function handle_profile_option(options)
 
     local plugin_path = ratelprof.get_opt_val(options, "plugin")
     if cuda then
+        local live = ratelprof.get_opt_val(options, "plugin-live")
+        if live and (plugin_path == "msgpack" or plugin_path == "stdout") then
+            Message:error("--plugin-live requires a custom CUDA plugin library.")
+            os.exit(1)
+        end
         if plugin_path ~= "msgpack" and plugin_path ~= "stdout" then
             if not ratelprof.fs.exists(plugin_path) or ratelprof.fs.is_dir(plugin_path) then
                 Message:error("CUDA output plugin library '"..plugin_path.."' not found.")
@@ -59,6 +64,7 @@ local function handle_profile_option(options)
             end
         end
         env.set_env("RATELPROF_CUDA_PLUGIN", plugin_path)
+        env.set_env("RATELPROF_CUDA_PLUGIN_LIVE", live and "1" or "0")
     elseif plugin_path then
         if plugin_path == "stdout"        then plugin_path = ratelprof.consts._LIBS.PLUGIN_STDOUT
         elseif plugin_path == "msgpack"   then plugin_path = ratelprof.consts._LIBS.PLUGIN_MSGPACK

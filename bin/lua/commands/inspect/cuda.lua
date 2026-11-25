@@ -7,6 +7,8 @@ local function fail(message)
 end
 
 local function tool(name)
+    local override = os.getenv("RATELPROF_"..name:upper())
+    if override and override ~= "" then return quote(override) end
     local root = os.getenv("CUDAToolkit_ROOT") or os.getenv("CUDA_HOME")
     return root and quote(root.."/bin/"..name) or name
 end
@@ -65,13 +67,23 @@ local function architecture_option(arch)
     return arch and " --gpu-architecture "..quote(arch) or ""
 end
 
+local function cuobjdump(operation, path, arch, prefix)
+    local command = (prefix or "")..tool("cuobjdump").." "..operation
+    local filename = " "..quote(path)
+    local output, status = capture(command..architecture_option(arch)..filename)
+    if arch and status ~= 0 and output:lower():find("unknown option", 1, true)
+        and output:find("gpu-architecture", 1, true) then
+        return capture(command..filename)
+    end
+    return output, status
+end
+
 local function emit_sass(application, arch, consume, identify_cubins)
-    local disassembler = os.getenv("RATELPROF_NVDISASM")
-    disassembler = disassembler and quote(disassembler) or tool("nvdisasm")
+    local disassembler = tool("nvdisasm")
     local _, available = capture("command -v "..disassembler)
     if available ~= 0 then
         if identify_cubins then fail("--pc-samples requires nvdisasm.") end
-        local output, status = capture(tool("cuobjdump").." --dump-sass"..architecture_option(arch).." "..quote(application))
+        local output, status = cuobjdump("--dump-sass", application, arch)
         if status ~= 0 then fail("cuobjdump could not disassemble the CUDA binary. "..output) end
         consume(ratelprof.fs.basename(application), output)
         return
@@ -83,8 +95,7 @@ local function emit_sass(application, arch, consume, identify_cubins)
     end
 
     local ok, err = pcall(function()
-        local extract = "cd "..quote(directory).." && "..tool("cuobjdump").." --extract-elf all"..architecture_option(arch).." "..quote(absolute)
-        local _, status = capture(extract)
+        local _, status = cuobjdump("--extract-elf all", absolute, arch, "cd "..quote(directory).." && ")
         local list = io.popen("find "..quote(directory).." -maxdepth 1 -type f -name '*.cubin' -print")
         local images = {}
         for path in list:lines() do images[#images + 1] = path end
@@ -96,6 +107,10 @@ local function emit_sass(application, arch, consume, identify_cubins)
             local image_arch = path:match("%.(sm_%d+[af]?)%.cubin$")
             if not arch or not image_arch or image_arch == arch then
                 local sass, result = capture(disassembler.." --print-code --no-dataflow "..quote(path))
+                if result ~= 0 and not identify_cubins then
+                    local fallback, status = cuobjdump("--dump-sass", path, path == absolute and arch or nil)
+                    if status == 0 then sass, result = fallback, status end
+                end
                 if result ~= 0 then error(sass, 0) end
                 consume(ratelprof.fs.basename(path), sass, path)
             end
@@ -110,6 +125,7 @@ local function instruction_counts(image, sass, fallback_arch, crc, functions)
     local architecture = image:match("(sm_%d+[af]?)") or fallback_arch or "unknown"
     for line in sass:gmatch("[^\r\n]+") do
         local arch = line:match("^%s*arch%s*=%s*(sm_%d+[af]?)")
+                 or line:match("^%s*code for%s+(sm_%d+[af]?)")
                  or line:match("^%s*%.target%s+(sm_%d+[af]?)")
         local elf_arch = line:match("^%s*%.headerflags%s+[^%d]*EF_CUDA_SM(%d+[af]?)")
         if not arch and elf_arch and architecture == "unknown" then arch = "sm_"..elf_arch end
@@ -161,7 +177,19 @@ local function inspect_inputs(application, linked)
 end
 
 local function resource_usage(input, arch)
-    local raw, status = capture(tool("cuobjdump").." --dump-resource-usage"..architecture_option(arch).." "..quote(input))
+    local raw, status = cuobjdump("--dump-resource-usage", input, arch)
+    if status ~= 0 and raw:lower():find("unknown option", 1, true)
+        and raw:find("dump-resource-usage", 1, true) then
+        -- Older toolkits can list machine code but have no resource-usage switch.
+        raw, status = cuobjdump("--dump-sass", input, arch)
+        if status == 0 then
+            local kernels = {}
+            for _, function_info in ipairs(instruction_counts(ratelprof.fs.basename(input), raw)) do
+                kernels[#kernels + 1] = {symbol = function_info.symbol, architecture = function_info.architecture}
+            end
+            return kernels
+        end
+    end
     if status ~= 0 then
         local message = raw:lower()
         if message:find("does not contain device code", 1, true)
@@ -175,7 +203,7 @@ local function resource_usage(input, arch)
     if kernels[1] and kernels[1].architecture == "unknown" then
         -- Standalone cubins have no fatbin header in --dump-resource-usage.
         local header = capture(tool("cuobjdump").." --dump-elf "..quote(input).." | head -n 4")
-        local sm = header:match("ELF:[^\r\n]-[,%s]sm=(%d+[af]?)")
+        local sm = header:lower():match("elf:[^\r\n]-[,%s]sm=(%d+[af]?)")
         if sm then
             for _, kernel in ipairs(kernels) do
                 if kernel.architecture == "unknown" then kernel.architecture = "sm_"..sm end
@@ -195,7 +223,10 @@ function inspect.kernels(application, options)
         local message
         sample_index, message = require("commands.inspect.pc_samples").load(options["pc-samples"])
         if not sample_index then fail(message) end
-        get_crc = require("ratelprof_cubin").get_crc
+        if not next(sample_index) then fail("The PC sampling report has no samples with a cubin CRC and symbol.") end
+        local ok, cubin = pcall(require, "ratelprof_cubin")
+        if not ok then fail("This installation lacks CUPTI cubin CRC support for --pc-samples.") end
+        get_crc = cubin.get_crc
     end
     local inputs, unresolved = inspect_inputs(application, options.linked)
     local kernels, disassemblies = {}, {}
@@ -232,7 +263,7 @@ function inspect.kernels(application, options)
         local name = options.mangled and kernel.symbol or ratelprof.utils.demangle(kernel.symbol, options.trunc)
         kernel.name = name
         local row = {name, kernel.architecture, kernel.REG or "", kernel.STACK or "",
-                     kernel.LOCAL or "", kernel.SHARED or "", kernel.constant_bytes,
+                     kernel.LOCAL or "", kernel.SHARED or "", kernel.constant_bytes or "",
                      kernel.TEXTURE or "", kernel.SURFACE or ""}
         if options.linked then row[#row + 1] = kernel.source end
         for i, value in ipairs(row) do row[i] = csv_value(value) end

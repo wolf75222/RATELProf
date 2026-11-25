@@ -13,7 +13,10 @@
 
 #ifdef RATELPROF_CUDA_CUBLAS
 #include <cublas_v2.h>
+#if __has_include(<cublasLt.h>)
 #include <cublasLt.h>
+#define RATELPROF_HAS_CUBLAS_LT
+#endif
 #endif
 
 #ifdef RATELPROF_CUDA_NCCL
@@ -90,16 +93,19 @@ WRAP(Cublas, cublasStatus_t, cublasDgemm_v2,
       const double *alpha, const double *a, int lda, const double *b, int ldb,
       const double *beta, double *c, int ldc),
      (h, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc))
+#if CUDART_VERSION >= 11000
 WRAP(Cublas, cublasStatus_t, cublasGemmEx,
      (cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
       const void *alpha, const void *a, cudaDataType at, int lda, const void *b, cudaDataType bt, int ldb,
       const void *beta, void *c, cudaDataType ct, int ldc, cublasComputeType_t compute, cublasGemmAlgo_t algo),
      (h, ta, tb, m, n, k, alpha, a, at, lda, b, bt, ldb, beta, c, ct, ldc, compute, algo))
+#endif
 WRAP(Cublas, cublasStatus_t, cublasSgemmStridedBatched,
      (cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
       const float *alpha, const float *a, int lda, long long sa, const float *b, int ldb, long long sb,
       const float *beta, float *c, int ldc, long long sc, int batch),
      (h, ta, tb, m, n, k, alpha, a, lda, sa, b, ldb, sb, beta, c, ldc, sc, batch))
+#ifdef RATELPROF_HAS_CUBLAS_LT
 WRAP(Cublas, cublasStatus_t, cublasLtCreate, (cublasLtHandle_t *handle), (handle))
 WRAP(Cublas, cublasStatus_t, cublasLtDestroy, (cublasLtHandle_t handle), (handle))
 WRAP(Cublas, cublasStatus_t, cublasLtMatmul,
@@ -108,6 +114,7 @@ WRAP(Cublas, cublasStatus_t, cublasLtMatmul,
       const void *c, cublasLtMatrixLayout_t cd, void *d, cublasLtMatrixLayout_t dd,
       const cublasLtMatmulAlgo_t *algo, void *workspace, size_t bytes, cudaStream_t stream),
      (h, compute, alpha, a, ad, b, bd, beta, c, cd, d, dd, algo, workspace, bytes, stream))
+#endif
 #endif
 
 #ifdef RATELPROF_CUDA_NCCL

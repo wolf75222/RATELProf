@@ -3,12 +3,13 @@
 ## NVIDIA CUDA backend
 
 This port writes RATELProf `master`-format reports (`8e71397`) with CUDA
-domains. It also reads AMD sectioned `.rprof-rep` reports (version 1.1.1)
-from `pre-release` through the export, analysis and viewer commands.
+domains. The analysis and viewer commands also read upstream AMD sectioned
+reports (1.1.1) and the fork's CUDA-aware sectioned format (1.2.0).
 
 Build the CUDA backend on Linux with CMake 3.18+, Python 3.8+, LuaJIT or Lua
-5.1, and the CUDA 12.9, 13.0 or 13.1 toolkit, including CUPTI and the CUDA
-binary utilities.
+5.1, and a CUDA toolkit with CUPTI and the CUDA binary utilities. The Activity
+collector selects record layouts from the installed CUPTI headers. Build with
+the CUPTI release you intend to load and use the toolkit for your GPU below.
 Use a separate install prefix for each backend.
 
 ```sh
@@ -21,8 +22,10 @@ export PATH="$HOME/.local/ratelprof-cuda/bin:$PATH"
 
 If several toolkits are installed, pass `-DCUDAToolkit_ROOT=/path/to/cuda` to
 CMake and put that toolkit's `bin` directory on `PATH` for inspection. The
-default build remains ROCm. For full host signature generation, put Clang on
-`PATH` before configuring. CMake discovers optional MPI, OpenMP, cuBLAS, and
+optional `-DRATELPROF_CUPTI_ROOT=/path/to/cupti` selects a separate CUPTI
+package for that toolkit. The default build remains ROCm. For full host
+signature generation, put Clang on `PATH` before configuring. CMake discovers
+optional MPI, OpenMP, cuBLAS, and
 NCCL headers. Set `MPI_C_COMPILER`, `RATELPROF_OMPT_INCLUDE_DIR`, or `NCCL_ROOT`
 if discovery needs a hint. MPI tracing uses the same MPI implementation and
 ABI as the application.
@@ -36,6 +39,7 @@ ratelprof analyze run.rprof-rep
 ratelprof visualize run.rprof-rep
 ratelprof export --type json run.rprof-rep
 ratelprof export --type arg-info run.rprof-rep
+ratelprof export --type sectioned run.rprof-rep
 ratelprof inspect --info gpu
 ratelprof inspect --linked --archs sm_90 --save-json --sass --sass-summary ./application
 ```
@@ -56,7 +60,8 @@ ratelprof inspect --linked --archs sm_90 --save-json --sass --sass-summary ./app
   as addresses, and unsupported by-value structures carry their size.
 - `inspect` reads kernel resources with `cuobjdump` and uses `nvdisasm` for
   SASS when available. `cuobjdump --dump-sass` is the fallback. The
-  `RATELPROF_NVDISASM` environment variable can point to a compatible disassembler.
+  Use `RATELPROF_NVDISASM` or `RATELPROF_CUOBJDUMP` to select utilities that
+  understand the cubin's architecture.
   `--sass-summary` counts static instructions by kernel and opcode in a
   `.sass.json` file. `--linked` searches recursive ELF dependencies without
   running the application. Use `--archs sm_80,sm_90` to restrict the images.
@@ -75,8 +80,13 @@ ratelprof inspect --linked --archs sm_90 --save-json --sass --sass-summary ./app
   interposition. A hand-written baseline is available without Clang or with
   `-DRATELPROF_CUDA_FULL_HOST_WRAPPERS=OFF`.
 - `--plugin stdout` emits text traces. `--plugin ./my-plugin.so` runs a custom
-  output hook after the report is written. Implement the C ABI in the installed
-  `include/ratelprof_cuda_plugin.h` header.
+  output hook after the report is written. Add `--plugin-live` and export
+  `ratelprof_cuda_plugin_process_activity_v1` to receive completed activities
+  during profiling. The live hook runs on a separate worker in collection order,
+  and CUPTI buffers are flushed periodically while the application runs. Join
+  each callback's `sequence` with `plugin_sequence` in the report. A slow hook
+  can miss activities if its queue fills. The report still retains those records.
+  Both hooks use the installed `include/ratelprof_cuda_plugin.h` C ABI.
 - `breakdown` reports active time by rank and by PID or GPU. It uses the
   union of observed event intervals to account for overlapping work and can
   export the tables as CSV or TSV.
@@ -85,17 +95,70 @@ The collector writes the report at normal process exit. CUDA uses event and
 stream synchronization, while HSA barrier AND/OR packets remain specific to
 the AMD backend. Existing ROCm live plugins keep their AMD ABI.
 
+`export --type sectioned` converts each rank to `*.sectioned.rprof-rep`.
+Sectioned 1.2.0 preserves the CUDA domain names and metadata. Read these files
+with the fork. Upstream `pre-release` readers implement AMD sectioned 1.1.1.
+
+### GPU generations and toolkit selection
+
+The toolkit and driver determine which measurements the GPU exposes. This
+table gives the paths to use and distinguishes them from hardware validation.
+
+| NVIDIA generation | Toolkit and timeline | Counters | PC sampling |
+| --- | --- | --- | --- |
+| Tesla architecture, SM 1.x | SASS with CUDA 5.5 for SM 1.0 and CUDA 6.5 for SM 1.1–1.3. Import available nvprof traces | Vendor recordings when available | — |
+| Fermi, SM 2.x | CUDA 8.0 or archived nvprof trace import | nvprof with the matching toolkit | — |
+| Kepler, SM 3.0/3.2 | CUDA 10.2 or archived nvprof trace import | Matching nvprof | — |
+| Kepler, SM 3.5/3.7 | CUDA 11.4 Update 2 on R470, or the separate Kepler CUPTI package for 11.8 | Matching nvprof | — |
+| Maxwell / Pascal, SM 5.x/6.x | CUDA 12.x or earlier matching toolkit | nvprof | Legacy CUPTI Activity from SM 5.2 on supported desktop devices |
+| Volta, SM 7.0/7.2 | CUDA 12.x | nvprof or Nsight Compute up to 2025.2.1 | Modern CUPTI with a Volta-compatible toolkit |
+| Turing, Ampere, Ada, Hopper, Blackwell | Matching CUDA 11.x/12.x/13.x toolkit, depending on the GPU | Nsight Compute | Modern CUPTI |
+| Rubin, including SM 10.7 | Toolkit with Rubin support such as CUDA 13.5 | Rubin-capable Nsight Compute | Modern CUPTI |
+
+The CUDA 8.0–13.x build paths depend on SDK capabilities. CUDA 8.0.61 was built
+and installed on Linux and used to generate and export a host-only report.
+That build also delivered a live OpenMP activity to a custom plugin.
+Offline SASS tests used real cubins for 30 targets across Tesla, Fermi, Kepler,
+Maxwell, Pascal, Volta, Turing, Ampere, Ada, Hopper, Blackwell and Rubin. The
+GH200 Hopper is the device used for live hardware validation. For old toolkits,
+build and collect on a Linux host with a compatible driver. Analysis can run
+on a separate host using the resulting reports.
+
+[NVIDIA toolkit and driver matrix](https://docs.nvidia.com/datacenter/tesla/drivers/latest/cuda-toolkit-driver-and-architecture-matrix.html)
+· [Legacy CUDA GPU compute capabilities](https://developer.nvidia.com/cuda/gpus/legacy)
+· [CUPTI 12.9 GPU support](https://docs.nvidia.com/cupti/12.9/release-notes/release-notes.html)
+· [CUPTI 13.5 GPU support](https://docs.nvidia.com/cupti/13.5.0/release-notes/release-notes.html)
+
+For a legacy capture, import one nvprof recording on a host with the matching
+version of the tool. GPU and API CSVs exported from the same recording are
+also accepted and can be converted offline without nvprof.
+
+```sh
+nvprof --export-profile legacy.nvprof ./legacy-application
+ratelprof import-nvprof --profile legacy.nvprof --arch sm_30 -o legacy.rprof-rep
+ratelprof import-nvprof --gpu gpu.csv --api api.csv --arch sm_30 -o legacy.rprof-rep
+```
+
+The importer preserves the timings, kernel launches, copies, memsets and CUDA
+API rows in the vendor trace. An API link is included when the trace supplies a
+correlation ID. CUPTI-only fields such as API arguments are available through
+native `profile` on supported builds.
+
 ### Hardware counters and PC sampling
 
 `metrics` uses Nsight Compute CLI for hardware counters, including DRAM and
 cache traffic, achieved occupancy, and warp stalls. `--source` also exports
 the source/SASS page when the report contains it. Keep the `.ncu-rep` file to
 re-export it without running the application again.
+Use `--arch sm_61` or `--backend nvprof` for legacy counters. CUDA 13 removed
+`nvprof`, so point `--nvprof` to the compatible archived toolkit when needed.
 
 ```sh
 ratelprof metrics -o counters --section SpeedOfLight -- ./application
 ratelprof metrics --import existing.ncu-rep -o counters --source
+ratelprof metrics --arch sm_61 --metrics achieved_occupancy -o legacy-counters -- ./application
 ratelprof sample --period 10 --dump-cubins cubins -o pc.json ./application
+ratelprof sample --arch sm_61 --dump-cubins cubins -o legacy-pc.json ./application
 ratelprof inspect --pc-samples pc.json -o kernel.csv cubins/module.cubin
 ```
 
@@ -105,6 +168,8 @@ addresses and warp stall reasons in a dedicated run. `inspect --pc-samples`
 uses `nvdisasm` and joins by cubin CRC, kernel symbol, and instruction offset.
 It writes per-instruction sample counts into the `.sass.json` output for
 matched cubins. Substitute the actual cubin file saved in `cubins/`.
+Legacy PC sampling serializes kernels. A legacy CUPTI build without cubin CRC
+support can display samples in the viewer using the recorded function and PC.
 
 Live hardware counters and PC sampling require performance counter access
 from the NVIDIA driver. Tool availability and supported metrics depend on

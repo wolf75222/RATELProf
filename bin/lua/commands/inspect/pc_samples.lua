@@ -35,13 +35,14 @@ function pc_samples.load(path)
     for _, sample in ipairs(report.samples) do
         if type(sample) ~= "table" then return nil, "Invalid PC sample." end
         local crc = type(sample.cubin_crc) == "string" and sample.cubin_crc:lower():match("^0x(%x+)$")
+        local missing_crc = report.mode == "legacy-serialized" and sample.cubin_crc == ""
         local symbol, offset = sample["function"], sample.pc_offset
-        if not crc or #crc > 16 or type(symbol) ~= "string"
+        if (not crc and not missing_crc) or (crc and #crc > 16) or type(symbol) ~= "string"
             or not is_count(offset) or type(sample.stall_reasons) ~= "table" then
             return nil, "Invalid cubin, symbol, offset or stall reasons in a PC sample."
         end
         -- CUPTI can omit the function name. There is no symbol to join in that case.
-        if symbol ~= "" then
+        if symbol ~= "" and crc then
             crc = "0x"..crc:gsub("^0+(%x)", "%1")
             local merged, message = merge(cubins, crc, symbol, offset, sample)
             if not merged then return nil, message end

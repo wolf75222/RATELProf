@@ -1,6 +1,4 @@
 #include <cupti.h>
-#include <cupti_driver_cbid.h>
-#include <cupti_runtime_cbid.h>
 #include <dlfcn.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -31,16 +29,7 @@ extern "C" {
 
 namespace {
 
-#if CUDA_VERSION >= 13010
-using KernelRecord = CUpti_ActivityKernel11;
-using ContextRecord = CUpti_ActivityContext4;
-#elif CUDA_VERSION >= 13000
-using KernelRecord = CUpti_ActivityKernel10;
-using ContextRecord = CUpti_ActivityContext3;
-#else
-using KernelRecord = CUpti_ActivityKernel9;
-using ContextRecord = CUpti_ActivityContext3;
-#endif
+#include "cupti_activity_records.inc"
 
 enum Domain { Runtime, Driver, Kernel, Copy, Memset, Sync, CudaEvent, Nvtx, MpiHost,
               OmpRoutineHost, OmpTargetHost, OmptHost, CublasHost, NcclHost, DomainCount };
@@ -58,6 +47,7 @@ constexpr size_t activity_buffer_size = 256 * 1024;
 struct Event {
     Domain domain;
     uint64_t start, stop;
+    uint64_t plugin_sequence = 0;
     uint32_t correlation = 0;
     uint32_t runtime_correlation = 0;
     uint32_t device = unknown, context = unknown, stream = unknown;
@@ -95,6 +85,10 @@ enum class ArgumentMode { None, Basic, Full };
 
 struct Trace {
     std::mutex mutex;
+    CudaActivityPlugin plugin;
+    uint64_t next_plugin_sequence = 0;
+    int plugin_rank = -1;
+    bool use_live_plugin = false;
     std::array<std::vector<Event>, DomainCount> events;
     std::map<uint32_t, Device> devices;
     std::unordered_map<uint32_t, uint32_t> contexts;
@@ -111,6 +105,7 @@ struct Trace {
     std::vector<std::string> argv;
     std::string output;
     uint64_t start = 0, epoch = 0, main_start = 0, main_stop = 0;
+    int64_t cupti_clock_offset = 0;
     int result = 0;
     pid_t pid = getpid();
     bool registered = false;
@@ -130,6 +125,14 @@ uint64_t clock_ns(clockid_t clock)
 uint64_t CUPTIAPI timestamp()
 {
     return clock_ns(CLOCK_MONOTONIC);
+}
+
+uint64_t activity_time(uint64_t time)
+{
+    if (!time || !trace->cupti_clock_offset)
+        return time;
+    const int64_t adjusted = static_cast<int64_t>(time) + trace->cupti_clock_offset;
+    return adjusted > 0 ? static_cast<uint64_t>(adjusted) : 0;
 }
 
 bool check(CUptiResult result, const char *operation)
@@ -252,28 +255,126 @@ void enable_api_arguments()
     }
 }
 
+uint64_t relative(uint64_t timestamp);
+
+PluginActivity plugin_activity(const Event &event)
+{
+    PluginActivity packet;
+    auto &activity = packet.activity;
+    activity.abi_version = 1;
+    activity.struct_size = sizeof(activity);
+    activity.sequence = event.plugin_sequence;
+    activity.mpi_rank = trace->plugin_rank;
+    activity.process_id = event.pid ? event.pid : trace->pid;
+    activity.domain = domains[event.domain];
+    activity.start_ns = relative(event.start);
+    activity.stop_ns = relative(event.stop);
+    activity.submitted_ns = event.submitted && event.submitted <= event.start
+        ? relative(event.submitted) : 0;
+    activity.experiment_start_epoch_ns = trace->epoch;
+    activity.thread_id = event.tid;
+    activity.byte_count = event.size;
+    activity.graph_node = event.graph_node;
+    activity.caller_address = event.caller;
+    activity.cupti_correlation_id = event.correlation;
+    activity.cupti_runtime_correlation_id = event.runtime_correlation;
+    activity.device_id = event.device;
+    if (activity.device_id == unknown) {
+        const auto context = trace->contexts.find(event.context);
+        if (context != trace->contexts.end())
+            activity.device_id = context->second;
+    }
+    activity.context_id = event.context;
+    activity.stream_id = event.stream;
+    const auto endpoint = [](uint64_t device) -> uint32_t {
+        if (device == host)
+            return RATELPROF_CUDA_HOST_DEVICE;
+        return device < unknown ? static_cast<uint32_t>(device) : RATELPROF_CUDA_NO_ID;
+    };
+    activity.source_device_id = endpoint(event.src);
+    activity.destination_device_id = endpoint(event.dst);
+    activity.source_memory_kind = event.src_kind;
+    activity.destination_memory_kind = event.dst_kind;
+    activity.cuda_event_id = event.cuda_event;
+    activity.cuda_event_sync_id = event.event_sync == unknown ? UINT64_MAX : event.event_sync;
+    activity.registers_per_thread = event.registers;
+    activity.local_memory_bytes = event.local;
+    activity.shared_memory_bytes = event.shared;
+    activity.memset_value = event.value;
+    std::copy(event.grid.begin(), event.grid.end(), activity.grid);
+    std::copy(event.block.begin(), event.block.end(), activity.block);
+
+    packet.name = event.name;
+    packet.annotation_domain = event.marker_domain;
+    if (event.domain == Runtime || event.domain == Driver) {
+        const auto api = trace->arguments.find(api_id(event.domain, event.correlation));
+        if (api != trace->arguments.end())
+            packet.arguments = api->second;
+        packet.arguments.push_back({"retval", "CUDA result", uint64_t{event.result}});
+    } else if (event.domain == Sync) {
+        packet.arguments.push_back({"retval", "CUDA result", uint64_t{event.result}});
+    } else {
+        packet.arguments = event.host_arguments;
+        if (event.has_host_result)
+            packet.arguments.push_back({"retval", "return value", event.host_result});
+    }
+    return packet;
+}
+
 void add(Event event)
 {
-    if (event.start && event.stop >= event.start && keep(event.domain, event.name))
-        trace->events[event.domain].push_back(std::move(event));
+    if (!event.start || event.stop < event.start || !keep(event.domain, event.name))
+        return;
+    if (trace->plugin.captures_activity()) {
+        event.plugin_sequence = ++trace->next_plugin_sequence;
+        try {
+            trace->plugin.enqueue(plugin_activity(event));
+        } catch (const std::bad_alloc &) {
+            trace->plugin.count_dropped_activity();
+        }
+    }
+    trace->events[event.domain].push_back(std::move(event));
 }
 
 bool device_memory(uint32_t kind)
 {
-    return kind == CUPTI_ACTIVITY_MEMORY_KIND_DEVICE || kind == CUPTI_ACTIVITY_MEMORY_KIND_ARRAY ||
-           kind == CUPTI_ACTIVITY_MEMORY_KIND_MANAGED || kind == CUPTI_ACTIVITY_MEMORY_KIND_DEVICE_STATIC ||
-           kind == CUPTI_ACTIVITY_MEMORY_KIND_MANAGED_STATIC;
+    switch (kind) {
+    case CUPTI_ACTIVITY_MEMORY_KIND_DEVICE:
+    case CUPTI_ACTIVITY_MEMORY_KIND_ARRAY:
+    case CUPTI_ACTIVITY_MEMORY_KIND_MANAGED:
+#ifdef RATELPROF_CUPTI_DEVICE_STATIC
+    case CUPTI_ACTIVITY_MEMORY_KIND_DEVICE_STATIC:
+#endif
+#ifdef RATELPROF_CUPTI_MANAGED_STATIC
+    case CUPTI_ACTIVITY_MEMORY_KIND_MANAGED_STATIC:
+#endif
+        return true;
+    default:
+        return false;
+    }
+}
+
+template<class Record>
+auto graph_node(const Record &record, int) -> decltype(record.graphNodeId)
+{
+    return record.graphNodeId;
+}
+
+template<class Record>
+uint64_t graph_node(const Record &, ...)
+{
+    return 0;
 }
 
 template<class Record>
 Event gpu_event(Domain domain, const Record &record)
 {
-    Event event(domain, record.start, record.end);
+    Event event(domain, activity_time(record.start), activity_time(record.end));
     event.correlation = record.correlationId;
     event.device = record.deviceId;
     event.context = record.contextId;
     event.stream = record.streamId;
-    event.graph_node = record.graphNodeId;
+    event.graph_node = graph_node(record, 0);
     return event;
 }
 
@@ -315,7 +416,8 @@ const char *sync_name(CUpti_ActivitySynchronizationType type)
     }
 }
 
-std::string uuid_string(const CUuuid &uuid)
+template<class Uuid>
+std::string uuid_string(const Uuid &uuid)
 {
     const auto *p = reinterpret_cast<const unsigned char *>(uuid.bytes);
     char buffer[37];
@@ -326,9 +428,10 @@ std::string uuid_string(const CUuuid &uuid)
     return buffer;
 }
 
-void marker(const CUpti_ActivityMarker2 &record)
+void marker(const MarkerRecord &record)
 {
-    Event event(Nvtx, record.timestamp, record.timestamp);
+    const auto time = activity_time(record.timestamp);
+    Event event(Nvtx, time, time);
     event.name = record.name ? record.name : "";
     event.marker_domain = record.domain ? record.domain : "";
     event.pid = record.objectKind == CUPTI_ACTIVITY_OBJECT_THREAD ||
@@ -347,11 +450,11 @@ void marker(const CUpti_ActivityMarker2 &record)
     } else if (record.flags & CUPTI_ACTIVITY_FLAG_MARKER_END) {
         auto start = trace->markers.find(record.id);
         if (start != trace->markers.end()) {
-            start->second.stop = record.timestamp;
+            start->second.stop = time;
             add(std::move(start->second));
             trace->markers.erase(start);
         } else {
-            trace->early_marker_ends[record.id] = record.timestamp;
+            trace->early_marker_ends[record.id] = time;
         }
     } else if (record.flags & CUPTI_ACTIVITY_FLAG_MARKER_INSTANTANEOUS) {
         add(std::move(event));
@@ -365,7 +468,7 @@ void collect(const CUpti_Activity *activity)
     case CUPTI_ACTIVITY_KIND_DRIVER: {
         const auto &record = *reinterpret_cast<const CUpti_ActivityAPI *>(activity);
         const bool runtime = activity->kind == CUPTI_ACTIVITY_KIND_RUNTIME;
-        Event event(runtime ? Runtime : Driver, record.start, record.end);
+        Event event(runtime ? Runtime : Driver, activity_time(record.start), activity_time(record.end));
         const char *name = nullptr;
         cuptiGetCallbackName(runtime ? CUPTI_CB_DOMAIN_RUNTIME_API : CUPTI_CB_DOMAIN_DRIVER_API,
                              record.cbid, &name);
@@ -386,24 +489,26 @@ void collect(const CUpti_Activity *activity)
         event.local = record.localMemoryPerThread;
         event.shared = record.staticSharedMemory + record.dynamicSharedMemory;
         event.registers = record.registersPerThread;
-        event.submitted = record.submitted;
+#ifdef RATELPROF_CUPTI_KERNEL_SUBMITTED
+        event.submitted = activity_time(record.submitted);
+#endif
         add(std::move(event));
         break;
     }
     case CUPTI_ACTIVITY_KIND_MEMCPY: {
-        const auto &record = *reinterpret_cast<const CUpti_ActivityMemcpy6 *>(activity);
+        const auto &record = *reinterpret_cast<const MemcpyRecord *>(activity);
         Event event = copy_event(record, record.deviceId, record.deviceId);
         event.runtime_correlation = record.runtimeCorrelationId;
         add(std::move(event));
         break;
     }
     case CUPTI_ACTIVITY_KIND_MEMCPY2: {
-        const auto &record = *reinterpret_cast<const CUpti_ActivityMemcpyPtoP4 *>(activity);
+        const auto &record = *reinterpret_cast<const PeerCopyRecord *>(activity);
         add(copy_event(record, record.srcDeviceId, record.dstDeviceId));
         break;
     }
     case CUPTI_ACTIVITY_KIND_MEMSET: {
-        const auto &record = *reinterpret_cast<const CUpti_ActivityMemset4 *>(activity);
+        const auto &record = *reinterpret_cast<const MemsetRecord *>(activity);
         Event event = gpu_event(Memset, record);
         event.name = "CUDA memset";
         event.size = record.bytes;
@@ -413,26 +518,33 @@ void collect(const CUpti_Activity *activity)
         break;
     }
     case CUPTI_ACTIVITY_KIND_SYNCHRONIZATION: {
-        const auto &record = *reinterpret_cast<const CUpti_ActivitySynchronization2 *>(activity);
-        Event event(Sync, record.start, record.end);
+        const auto &record = *reinterpret_cast<const SyncRecord *>(activity);
+        Event event(Sync, activity_time(record.start), activity_time(record.end));
         event.name = sync_name(record.type);
         event.correlation = record.correlationId;
         event.context = record.contextId;
         event.stream = record.streamId;
         event.cuda_event = record.cudaEventId;
+#ifdef RATELPROF_CUPTI_SYNC_EVENT_ID
         event.event_sync = record.cudaEventSyncId;
+#endif
+#ifdef RATELPROF_CUPTI_SYNC_RESULT
         event.result = record.returnValue;
+#else
+        event.result = unknown;
+#endif
         add(std::move(event));
         break;
     }
+#ifdef RATELPROF_CUPTI_EVENT_DEVICE_TIMESTAMP
     case CUPTI_ACTIVITY_KIND_CUDA_EVENT: {
-        const auto &record = *reinterpret_cast<const CUpti_ActivityCudaEvent2 *>(activity);
+        const auto &record = *reinterpret_cast<const CudaEventRecord *>(activity);
+        const auto time = activity_time(record.deviceTimestamp);
         if (record.cudaEventSyncId != unknown) {
             trace->cuda_events.insert_or_assign(record.cudaEventSyncId,
-                EventRecording{record.deviceId, record.contextId, record.streamId,
-                               record.deviceTimestamp});
+                EventRecording{record.deviceId, record.contextId, record.streamId, time});
         }
-        Event event(CudaEvent, record.deviceTimestamp, record.deviceTimestamp);
+        Event event(CudaEvent, time, time);
         event.name = "CUDA event record";
         event.correlation = record.correlationId;
         event.context = record.contextId;
@@ -443,14 +555,23 @@ void collect(const CUpti_Activity *activity)
         add(std::move(event));
         break;
     }
+#endif
     case CUPTI_ACTIVITY_KIND_DEVICE: {
-        const auto &record = *reinterpret_cast<const CUpti_ActivityDevice5 *>(activity);
+        const auto &record = *reinterpret_cast<const DeviceRecord *>(activity);
+#ifdef RATELPROF_CUPTI_DEVICE_VISIBLE
         if (!record.isCudaVisible)
             break;
+#endif
         const auto arch = "sm_" + std::to_string(record.computeCapabilityMajor) +
                           std::to_string(record.computeCapabilityMinor);
+        std::string uuid;
+#ifdef RATELPROF_CUPTI_DEVICE_MIG_UUID
+        uuid = uuid_string(record.isMigEnabled ? record.migUuid : record.uuid);
+#elif defined(RATELPROF_CUPTI_DEVICE_UUID)
+        uuid = uuid_string(record.uuid);
+#endif
         trace->devices[record.id] = {record.name ? record.name : "NVIDIA GPU",
-            uuid_string(record.isMigEnabled ? record.migUuid : record.uuid), arch,
+            std::move(uuid), arch,
             record.numMultiprocessors, record.numThreadsPerWarp, record.globalMemorySize};
         break;
     }
@@ -460,7 +581,7 @@ void collect(const CUpti_Activity *activity)
         break;
     }
     case CUPTI_ACTIVITY_KIND_MARKER:
-        marker(*reinterpret_cast<const CUpti_ActivityMarker2 *>(activity));
+        marker(*reinterpret_cast<const MarkerRecord *>(activity));
         break;
     default:
         break;
@@ -501,6 +622,24 @@ void enable(CUpti_ActivityKind kind, const char *name)
         trace->enabled.push_back(kind);
 }
 
+bool initialize_activity_clock()
+{
+#ifdef RATELPROF_CUPTI_TIMESTAMP_CALLBACK
+    if (check(cuptiActivityRegisterTimestampCallback(timestamp), "set activity clock"))
+        return true;
+#endif
+    // Older SDKs use a built-in clock shared by cuptiGetTimestamp and activity records.
+    const auto before = timestamp();
+    uint64_t activity_clock = 0;
+    const auto result = cuptiGetTimestamp(&activity_clock);
+    const auto after = timestamp();
+    if (!check(result, "calibrate activity clock"))
+        return false;
+    const auto midpoint = before + (after - before) / 2;
+    trace->cupti_clock_offset = static_cast<int64_t>(midpoint) - static_cast<int64_t>(activity_clock);
+    return true;
+}
+
 void initialize_cupti()
 {
     bool requested = trace->capture_modules;
@@ -516,7 +655,7 @@ void initialize_cupti()
                      version, CUPTI_API_VERSION);
         return;
     }
-    if (!check(cuptiActivityRegisterTimestampCallback(timestamp), "set activity clock") ||
+    if (!initialize_activity_clock() ||
         !check(cuptiActivityRegisterCallbacks(request_buffer, complete_buffer), "register activity buffers"))
         return;
 
@@ -528,7 +667,9 @@ void initialize_cupti()
     if (enabled(Driver))
         enable(CUPTI_ACTIVITY_KIND_DRIVER, "CUDA Driver activity");
     if (enabled(Kernel)) {
+#ifdef RATELPROF_CUPTI_LATENCY_TIMESTAMPS
         check(cuptiActivityEnableLatencyTimestamps(1), "kernel latency timestamps");
+#endif
         enable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL, "kernel activity");
     }
     if (enabled(Copy)) {
@@ -540,10 +681,14 @@ void initialize_cupti()
     if (enabled(Sync))
         enable(CUPTI_ACTIVITY_KIND_SYNCHRONIZATION, "synchronization activity");
     if (enabled(CudaEvent)) {
-#if CUDA_VERSION >= 13000
+#ifdef RATELPROF_CUPTI_REQUEST_EVENT_TIMESTAMPS
         check(cuptiActivityEnableCudaEventDeviceTimestamps(1), "CUDA event device timestamps");
 #endif
+#ifdef RATELPROF_CUPTI_EVENT_DEVICE_TIMESTAMP
         enable(CUPTI_ACTIVITY_KIND_CUDA_EVENT, "CUDA event activity");
+#else
+        std::fprintf(stderr, "RATELProf CUDA: this CUPTI SDK has no timestamped CUDA event records\n");
+#endif
     }
     if (enabled(Nvtx))
         enable(CUPTI_ACTIVITY_KIND_MARKER, "NVTX marker activity");
@@ -645,7 +790,10 @@ void encode_event(msgpack_buffer_t &buf, const Event &event, const Event *api)
 {
     const bool gpu = event.domain == Kernel || event.domain == Copy ||
                      event.domain == Memset || event.domain == CudaEvent;
-    msgpack_encode_map(&buf, gpu ? 6 : 9 + (event.caller != 0));
+    const unsigned fields = gpu ? 6 : 9 + (event.caller != 0);
+    msgpack_encode_map(&buf, fields + (event.plugin_sequence != 0));
+    if (event.plugin_sequence)
+        field(buf, "plugin_sequence", event.plugin_sequence);
     field(buf, "phase", phase(event.start));
     field(buf, "corr_id", api ? api_id(api->domain, api->correlation) : 0);
     field(buf, "start", relative(event.start));
@@ -950,6 +1098,7 @@ void finish()
         return;
     trace->accepting_host = false;
     const uint64_t stop = timestamp();
+    trace->plugin.set_periodic_flush(nullptr);
     if (trace->registered) {
         check(cuptiActivityFlushAll(0), "flush completed activities");
         if (trace->subscriber)
@@ -960,6 +1109,7 @@ void finish()
     }
     if (trace->capture_modules)
         finish_module_capture();
+    trace->plugin.drain();
 
     const int rank = mpi_rank();
     if (trace->dropped)
@@ -982,8 +1132,13 @@ void finish()
             std::lock_guard<std::mutex> guard(trace->mutex);
             published = write_report(path, rank, stop);
         }
-        if (published)
-            ratelprof_cuda_run_output_plugin(path.c_str(), rank, trace->pid, trace->result);
+        if (published) {
+            if (trace->use_live_plugin)
+                trace->plugin.process_report(path.c_str(), rank, trace->pid, trace->result);
+            else
+                ratelprof_cuda_run_output_plugin(path.c_str(), rank, trace->pid, trace->result);
+        }
+        trace->plugin.close();
     }
 }
 
@@ -1003,13 +1158,13 @@ int traced_main(int argc, char **argv, char **env)
 uint64_t host_begin(HostDomain domain)
 {
     return trace && trace->accepting_host && getpid() == trace->pid && enabled(host_domains[domain])
-        ? timestamp() : 0;
+        && !ratelprof_cuda_in_plugin_callback() ? timestamp() : 0;
 }
 
 bool host_arguments_enabled(HostDomain domain)
 {
     return trace && trace->argument_mode == ArgumentMode::Full && enabled(host_domains[domain])
-        && trace->accepting_host && getpid() == trace->pid;
+        && trace->accepting_host && getpid() == trace->pid && !ratelprof_cuda_in_plugin_callback();
 }
 
 void host_end(HostDomain domain, const char *name, uint64_t start, const void *caller,
@@ -1078,9 +1233,20 @@ extern "C" int __libc_start_main(Main main, int argc, char **argv, void (*init)(
 #endif
         for (int i = 0; i < argc; ++i)
             trace->argv.emplace_back(argv[i]);
-        // Run after the profiled executable's exit handlers and destructors.
+        const char *live = std::getenv("RATELPROF_CUDA_PLUGIN_LIVE");
+        trace->use_live_plugin = live && std::strcmp(live, "1") == 0;
+        if (trace->use_live_plugin) {
+            trace->plugin_rank = mpi_rank();
+            trace->plugin.open();
+        }
+        // Run after application destructors and before live plugin destructors.
         std::atexit(finish);
         initialize_cupti();
+        if (trace->registered && trace->plugin.captures_activity()) {
+            trace->plugin.set_periodic_flush([] {
+                return check(cuptiActivityFlushAll(0), "flush activities for live plugin");
+            });
+        }
         application_main = main;
         main = traced_main;
     }

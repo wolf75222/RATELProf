@@ -28,9 +28,12 @@ IF(RATELPROF_BACKEND STREQUAL "rocm")
     TARGET_LINK_DIRECTORIES(ratelprof_agent_query PRIVATE /opt/rocm/lib)
 ELSE()
     ADD_LUA_LIBRARY(ratelprof_cuda_agent ratelprof_cuda_agent.c)
-    TARGET_LINK_LIBRARIES(ratelprof_cuda_agent PRIVATE CUDA::cuda_driver)
-    ADD_LUA_LIBRARY(ratelprof_cubin ratelprof_cubin.c)
-    TARGET_LINK_LIBRARIES(ratelprof_cubin PRIVATE CUDA::cupti)
+    TARGET_LINK_LIBRARIES(ratelprof_cuda_agent PRIVATE CUDA::cuda_driver ${CMAKE_DL_LIBS})
+    IF(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 11.8 AND
+       EXISTS "${RATELPROF_CUPTI_HEADERS}/cupti_pcsampling.h")
+        ADD_LUA_LIBRARY(ratelprof_cubin ratelprof_cubin.c)
+        TARGET_LINK_LIBRARIES(ratelprof_cubin PRIVATE ${RATELPROF_CUPTI_TARGET})
+    ENDIF()
 ENDIF()
 
 
