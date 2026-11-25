@@ -34,12 +34,13 @@ local function get_last_label(domain_id, is_cuda)
     local last_label = "N/A"
     if ratelprof.consts._ENV.DOMAIN_KERNEL     == domain_id or
        ratelprof.consts._ENV.DOMAIN_BARRIEROR  == domain_id or
-       ratelprof.consts._ENV.DOMAIN_BARRIERAND == domain_id then
+       ratelprof.consts._ENV.DOMAIN_BARRIERAND == domain_id or
+       ratelprof.consts._ENV.DOMAIN_MEMORY_FILL == domain_id then
         last_label = '"Queue ID"'
     elseif ratelprof.consts._ENV.DOMAIN_CUDA_MEMSET == domain_id then
         last_label = '"CUDA stream ID"'
     elseif ratelprof.consts._ENV.DOMAIN_COPY == domain_id then
-        last_label = '"SDMA ID"'
+        last_label = '"Engine or queue ID"'
     else
         last_label = "TID"
     end
@@ -76,6 +77,17 @@ local function get_event_data(data, event, domain_id, opt)
         first_value = data:get_gpu_id(event.args.gpu_id, event.mpi_rank)
         group = event.args.queue_id
         args = event.args
+    elseif ratelprof.consts._ENV.DOMAIN_CUDA_EVENT == domain_id then
+        event_content = "CUDA event record"
+        first_value = data:get_gpu_id(event.args.gpu_id, event.mpi_rank)
+        group = event.args.queue_id
+        args = event.args
+    elseif ratelprof.consts._ENV.DOMAIN_MEMORY_FILL == domain_id then
+        event_content = event.args.operation_name
+        first_value = data:get_gpu_id(event.args.gpu_id, event.mpi_rank)
+        group = event.args.queue_id
+        args = event.args
+
     elseif ratelprof.consts._ENV.DOMAIN_BARRIEROR == domain_id then
         event_content  = "Barrier OR"
 
@@ -102,7 +114,7 @@ local function get_event_data(data, event, domain_id, opt)
         local src_node  = data:get_gpu_id(src_agent, event.mpi_rank)
         local dst_node  = data:get_gpu_id(dst_agent, event.mpi_rank)
         first_value     = data:node_is_gpu(src_node) and src_node or dst_node
-        group = event.args.engine_id
+        group = event.args.queue_id or event.args.engine_id
 
         args.src = ratelprof.utils.get_copy_name_from_kind(event.args.src_type) ..
             " Node ID. "..src_node.." ("..src_agent..")"

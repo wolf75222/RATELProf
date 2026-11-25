@@ -1,9 +1,21 @@
-local function find_coalescable_transfers(traces_data, DURATION_THRESHOLD_NS, GAP_THRESHOLD_NS, MIN_SEQUENCE_LEN, opt)
+local function transfer_channel(event)
+    local args = event.args
+    if args.context_id ~= nil then
+        return string.format("rank %s, context %s, stream %s",
+                             event.mpi_rank, args.context_id, args.queue_id or args.engine_id)
+    end
+    if args.queue_id ~= nil then
+        return "queue " .. args.queue_id
+    end
+    return "SDMA " .. args.engine_id
+end
+
+local function find_coalescable_transfers(traces_data, DURATION_THRESHOLD_NS, GAP_THRESHOLD_NS, MIN_SEQUENCE_LEN)
 
     local items = {}
     local sequences_per_gpu = {}
 
-    local function on_sequence_end(sequence, gpu_node_id, sdma, name)
+    local function on_sequence_end(sequence, gpu_node_id, channel, name)
         if #sequence >= MIN_SEQUENCE_LEN then
             local sequence_start = sequence[1].start
             local sequence_stop = sequence[#sequence].stop
@@ -20,7 +32,7 @@ local function find_coalescable_transfers(traces_data, DURATION_THRESHOLD_NS, GA
 
             table.insert(items, {
                 tostring(gpu_node_id),
-                tostring(sdma),
+                channel,
                 #sequence,
                 sequence_start,
                 sequence_dur,
@@ -41,40 +53,40 @@ local function find_coalescable_transfers(traces_data, DURATION_THRESHOLD_NS, GA
 
         if #copy_data == 0 then return end
 
-        local last_for_each_sdma = {}
-        local sequence_for_each_sdma = {}
+        local last_by_channel = {}
+        local sequences = {}
         for _, c in ipairs(copy_data) do
-            local sdma_id  = c.args.engine_id
-            local curr_last = last_for_each_sdma[sdma_id]
-            local sequence  = sequence_for_each_sdma[sdma_id] or {}
+            local channel = transfer_channel(c)
+            local curr_last = last_by_channel[channel]
+            local sequence = sequences[channel] or {}
 
             if c.dur > DURATION_THRESHOLD_NS then
-                -- Skip large kernels
                 if curr_last then
-                    on_sequence_end(sequence, gpu_node_id, sdma_id, ratelprof.utils.get_copy_name_from_trace(curr_last))
+                    on_sequence_end(sequence, gpu_node_id, channel, ratelprof.utils.get_copy_name_from_trace(curr_last))
                 end
                 sequence = {}
                 curr_last = nil
             elseif not curr_last or (c.args.src_agent == curr_last.args.src_agent and c.args.dst_agent == curr_last.args.dst_agent 
+                    and c.start >= curr_last.stop
                     and c.start - curr_last.stop < GAP_THRESHOLD_NS) then
                 -- Add to sequence
                 table.insert(sequence, c)
                 curr_last = c
             else
                 -- Check and reset
-                on_sequence_end(sequence, gpu_node_id, sdma_id, ratelprof.utils.get_copy_name_from_trace(curr_last))
+                on_sequence_end(sequence, gpu_node_id, channel, ratelprof.utils.get_copy_name_from_trace(curr_last))
                 sequence = {c}
                 curr_last = c
             end
-            last_for_each_sdma[sdma_id] = curr_last
-            sequence_for_each_sdma[sdma_id] = sequence
+            last_by_channel[channel] = curr_last
+            sequences[channel] = sequence
         end
 
         -- Final check for each queue
-        for sdma_id, sequence in pairs(sequence_for_each_sdma) do
-            local last = last_for_each_sdma[sdma_id]
+        for channel, sequence in pairs(sequences) do
+            local last = last_by_channel[channel]
             if last then
-                on_sequence_end(sequence, gpu_node_id, sdma_id, ratelprof.utils.get_copy_name_from_trace(last))
+                on_sequence_end(sequence, gpu_node_id, channel, ratelprof.utils.get_copy_name_from_trace(last))
             end
         end
     end)
@@ -84,23 +96,15 @@ end
 
 
 local function compute_coalescable_transfers_speedup(data, app_dur)
-    local total_gaps_per_sdma = {}
+    local gaps_by_channel = {}
 
     for _, e in ipairs(data) do
-        local sdma = e[2]
-        local gaps_duration = e[6]
-
-        if not total_gaps_per_sdma[sdma] then
-            total_gaps_per_sdma[sdma] = 0
-        end
-        total_gaps_per_sdma[sdma] = total_gaps_per_sdma[sdma] + gaps_duration
+        local channel = e[1] .. "/" .. e[2]
+        gaps_by_channel[channel] = (gaps_by_channel[channel] or 0) + e[6]
     end
 
-    local max_gap_dur, _ = table.max(total_gaps_per_sdma)
-
-    if max_gap_dur == nil or max_gap_dur == 0 then
-        error("Invalid max ideal duration")
-    end
+    local max_gap_dur = table.max(gaps_by_channel)
+    if not max_gap_dur or max_gap_dur >= app_dur then return 1 end
 
     return app_dur / (app_dur - max_gap_dur)
 end
@@ -113,7 +117,7 @@ return function(traces_data, _, opt)
 
     local speedup_factor = 1
 
-    local data, sequences_per_gpu = find_coalescable_transfers(traces_data, DURATION_THRESHOLD_NS, GAP_THRESHOLD_NS, MIN_SEQUENCE_LEN, opt)
+    local data, sequences_per_gpu = find_coalescable_transfers(traces_data, DURATION_THRESHOLD_NS, GAP_THRESHOLD_NS, MIN_SEQUENCE_LEN)
 
     local msg = ""
 
@@ -125,7 +129,7 @@ return function(traces_data, _, opt)
         msg = [[
 The following memory transfers sequences may benefit from coalescing into fewer, larger transfers.
 These sequences were identified as:
-  - Being the same transfers kind in the same SDMA,
+  - Transfers of the same kind on the same stream, queue, or SDMA engine,
   - Transfers back-to-back with a gap smaller than ]] .. GAP_THRESHOLD_NS .. [[ ns,
   - Each individual transfers shorter than ]] .. DURATION_THRESHOLD_NS .. [[ ns,
   - Appearing at least ]] .. MIN_SEQUENCE_LEN .. [[ times in sequence.
@@ -152,7 +156,7 @@ Optimizing these transfers might speed up your application by ]] .. string.forma
         TYPE = "Analyze",
         HEADER = {
             "GPU ID",
-            "SDMA",
+            "Stream / Queue / SDMA",
             "Seq Length",
             "Seq Start (ns)",
             "Seq Duration (ns)",

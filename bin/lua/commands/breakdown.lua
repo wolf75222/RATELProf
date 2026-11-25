@@ -8,11 +8,13 @@ local host_domains = {
     [E.DOMAIN_HIP] = "runtime", [E.DOMAIN_HSA] = "runtime",
     [E.DOMAIN_CUDA_RUNTIME] = "runtime", [E.DOMAIN_CUDA_DRIVER] = "runtime",
     [E.DOMAIN_CUDA_SYNC] = "runtime", [E.DOMAIN_CUBLAS] = "runtime", [E.DOMAIN_NCCL] = "runtime",
+    [E.DOMAIN_ROCBLAS] = "runtime", [E.DOMAIN_RCCL] = "runtime",
     [E.DOMAIN_OMP_TGT] = "omp", [E.DOMAIN_OMP_TGT_RTL] = "omp", [E.DOMAIN_OMPT] = "omp",
     [E.DOMAIN_MPI] = "mpi",
 }
 local device_domains = {
     [E.DOMAIN_KERNEL] = "compute", [E.DOMAIN_COPY] = "memory", [E.DOMAIN_CUDA_MEMSET] = "memory",
+    [E.DOMAIN_MEMORY_FILL] = "memory",
     [E.DOMAIN_BARRIEROR] = "barrier", [E.DOMAIN_BARRIERAND] = "barrier",
 }
 

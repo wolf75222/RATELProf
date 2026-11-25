@@ -5,6 +5,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <type_traits>
+#include <utility>
+
+#if defined(RATELPROF_GENERATED_HOST_WRAPPERS) && defined(RATELPROF_OMP_HEADER)
+#include RATELPROF_OMP_HEADER
+#endif
 
 #ifdef RATELPROF_CUDA_CUBLAS
 #include <cublas_v2.h>
@@ -34,37 +39,39 @@ Function resolve(const char *name)
     return fn;
 }
 
-template<class Call>
-auto traced(HostDomain domain, const char *name, const void *caller, Call call)
+template<class Call, class ReadArguments>
+auto traced(HostDomain domain, const char *name, const void *caller, Call call,
+            ReadArguments read_arguments)
 {
-    const uint64_t start = host_begin(domain);
     using Result = decltype(call());
+    TraceArguments arguments;
+    if (host_arguments_enabled(domain))
+        arguments = read_arguments();
+    const uint64_t start = host_begin(domain);
     if constexpr (std::is_void_v<Result>) {
         call();
         if (start)
-            host_end(domain, name, start, caller);
+            host_end(domain, name, start, caller, int64_t{0}, false, std::move(arguments));
     } else {
         auto result = call();
-        if (start) {
-            int64_t value;
-            if constexpr (std::is_pointer_v<Result>)
-                value = reinterpret_cast<intptr_t>(result);
-            else
-                value = result;
-            host_end(domain, name, start, caller, value, true);
-        }
+        if (start)
+            host_end(domain, name, start, caller, trace_argument_value(result), true, std::move(arguments));
         return result;
     }
 }
 
 } // namespace
 
+#ifdef RATELPROF_GENERATED_HOST_WRAPPERS
+#include RATELPROF_GENERATED_HOST_WRAPPERS
+#else
+
 #define WRAP(domain, result, name, params, args)                                   \
     extern "C" result name params                                                  \
     {                                                                             \
         static const auto original = resolve<result (*) params>(#name);            \
         return traced(domain, #name, __builtin_return_address(0),                   \
-                      [&] { return original args; });                              \
+                      [&] { return original args; }, [] { return TraceArguments{}; });                              \
     }
 
 #ifdef RATELPROF_CUDA_CUBLAS
@@ -213,3 +220,5 @@ WRAP(Mpi, int, MPI_Alltoall,
      (const void *send, int sc, MPI_Datatype st, void *recv, int rc, MPI_Datatype rt, MPI_Comm comm),
      (send, sc, st, recv, rc, rt, comm))
 #endif
+
+#endif // RATELPROF_GENERATED_HOST_WRAPPERS

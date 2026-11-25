@@ -48,8 +48,15 @@ local function handle_profile_option(options)
     local plugin_path = ratelprof.get_opt_val(options, "plugin")
     if cuda then
         if plugin_path ~= "msgpack" and plugin_path ~= "stdout" then
-            Message:error("CUDA profiling requires the msgpack or stdout plugin.")
-            os.exit(1)
+            if not ratelprof.fs.exists(plugin_path) or ratelprof.fs.is_dir(plugin_path) then
+                Message:error("CUDA output plugin library '"..plugin_path.."' not found.")
+                os.exit(1)
+            end
+            plugin_path = ratelprof.utils.execute_command("realpath -- " .. quote(plugin_path))
+            if plugin_path == "" then
+                Message:error("Cannot resolve the CUDA output plugin path.")
+                os.exit(1)
+            end
         end
         env.set_env("RATELPROF_CUDA_PLUGIN", plugin_path)
     elseif plugin_path then
@@ -150,6 +157,19 @@ function profile.process_profiling(positional_args, options_values)
         if inherited and inherited ~= "" then libraries[#libraries + 1] = inherited end
         env.set_env("LD_PRELOAD", table.concat(libraries, ":"))
         env.set_env("NVTX_INJECTION64_PATH", lib)
+        local api_args = options_values["api-args"]
+        if api_args ~= "basic" and api_args ~= "all" and api_args ~= "none" then
+            Message:error("--api-args expects basic, all or none.")
+            os.exit(1)
+        end
+        env.set_env("RATELPROF_CUDA_API_ARGS", api_args)
+        if options_values["dump-cubins"] then
+            local cubins = options_values["dump-cubins"]
+            if cubins:sub(1, 1) ~= "/" then
+                cubins = ratelprof.utils.execute_command("pwd -P").."/"..cubins
+            end
+            env.set_env("RATELPROF_DUMP_CUBINS", cubins)
+        end
         Message:print("RPROF: CUDA profiling enabled for "..table.concat(opt.enabled_domain, ", "))
         run_application(prefix.."env -u RATELPROF_CUDA_OWNER "..env.get_env().." "..app_cmd, opt)
         return

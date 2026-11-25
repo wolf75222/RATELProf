@@ -12,10 +12,12 @@ from collections import defaultdict
 from itertools import islice
 from pathlib import Path
 
+from measurements import measurement_tables
+
 
 BUCKET_SIZE = 100_000
 HISTOGRAM_BARS = 1_000
-GPU_DOMAINS = {"KERNEL", "COPY", "CUDA_MEMSET", "BARRIERAND", "BARRIEROR"}
+GPU_DOMAINS = {"KERNEL", "COPY", "CUDA_MEMSET", "CUDA_EVENT", "MEMORY_FILL", "BARRIERAND", "BARRIEROR"}
 DOMAIN_PREFIX = "RATELPROF_DOMAIN_"
 
 
@@ -79,6 +81,8 @@ def event_name(domain, event):
         return f"Copy {src} to {dst}"
     if domain == "CUDA_MEMSET":
         return "CUDA memset"
+    if domain == "MEMORY_FILL":
+        return args.get("operation_name", "Memory fill")
     return event.get("name", domain)
 
 
@@ -100,14 +104,14 @@ def track_key(domain, event, nodes):
     if domain not in GPU_DOMAINS:
         return ("PID", event.get("pid", 0), "TID", event.get("tid", 0))
     controller = args.get("gpu_id")
-    if domain == "COPY":
+    if domain == "COPY" and controller is None:
         controller = args["dst_agent"] if args.get("dst_type") == 1 else args["src_agent"]
     gpu = nodes.get(controller, 0)
     context = args.get("context_id")
     if context is not None:
         label = f"Stream (context {context})"
     else:
-        label = "Engine" if domain == "COPY" else "Queue"
+        label = "Engine" if domain == "COPY" and "queue_id" not in args else "Queue"
     return ("GPU", gpu, label, args.get("queue_id", args.get("engine_id", 0)))
 
 
@@ -308,6 +312,8 @@ def export(payload, viewer, output):
         raise ValueError("Expected the root of a RATELProf-Visualize checkout with share/html.")
     if assets == output.resolve() or assets in output.resolve().parents:
         raise ValueError("Choose an output directory outside the viewer's source assets.")
+    statistics = dict(payload["statistics"] or {})
+    statistics.update(measurement_tables(payload.get("measurements") or {}))
     shutil.copytree(assets, output, dirs_exist_ok=True)
     selector = output / "timeline" / "js" / "SelectInput.js"
     if selector.is_file():
@@ -357,7 +363,7 @@ def export(payload, viewer, output):
     write_js(data_dir / "summary.js", "const __SUMMARY_DATA__", {
         "PROFILING": profiling, "EXPERIMENT": experiment, "GPU": {"Report": gpus},
     })
-    write_tables(data_dir, "statistics", payload["statistics"])
+    write_tables(data_dir, "statistics", statistics)
     write_tables(data_dir, "analyze", payload["analyze"])
     write_js(data_dir / "misc.js", "document.title", "RATELProf - " + output.name)
 

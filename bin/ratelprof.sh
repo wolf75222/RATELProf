@@ -7,6 +7,8 @@ Usage: ratelprof [--help] <command> [options] [command args]
 
 Commands:
   profile       Run an application and capture its profile into a .rprof-rep file.
+  metrics       Collect or import hardware counters with Nsight Compute.
+  sample        Collect CUDA program counter and warp stall samples with CUPTI.
   stats         Generate statistics from an existing .rprof-rep file.
   analyze       Run optimization rules on a profile.
   breakdown     Break down CPU and GPU activity by rank, process and device.
@@ -24,6 +26,11 @@ BIN_DIR=$(dirname "$0")
 LUA_DIR=$BIN_DIR/lua
 export LUA_PATH="$LUA_DIR/?.lua;;"
 export INSTALL_DIR="$(realpath "$BIN_DIR/..")"
+
+if [ "$1" = metrics ]; then
+    shift
+    exec python3 "$INSTALL_DIR/share/modules/metrics/metrics.py" "$@"
+fi
 
 # Function to check if a command exists
 command_exists() {
@@ -54,7 +61,7 @@ case "$CMD" in
         display_help
         ;;
 
-    profile|stats|analyze|breakdown|visualize|inspect|export|summarize)
+    profile|stats|analyze|breakdown|visualize|inspect|export|summarize|sample)
         exec "$LUA_EXEC" "$LUA_DIR/$CMD.lua" "$@"
         ;;
 

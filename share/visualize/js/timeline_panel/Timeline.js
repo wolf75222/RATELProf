@@ -517,6 +517,13 @@ class Timeline {
                 append(rcol, "Size initialized",   convertBytes(args.size));
                 append(rcol, "Value",              args.value);
 
+            } else if (domain === "CUDA Event Record") {
+                append(rcol, "GPU ID",             this.values[0]);
+                append(rcol, "CUDA Stream ID",     trace.group);
+                append(rcol, "CUDA Context ID",    args.context_id);
+                append(rcol, "Event ID",           args.event_id);
+                append(rcol, "Event Record ID",    args.event_sync_id);
+
             } else if (domain === "Barrier AND" || domain === "Barrier OR") {
                 append(lcol, "Dispatch Time",      convertTime(args.dispatch_time));
                 append(rcol, "GPU ID",             this.values[0]);

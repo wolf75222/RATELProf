@@ -37,6 +37,17 @@ end
 consts_helper.profile = {
     desc = "\n\tProfile a GPU application with the selected backend.",
     opt = {
+        ['api-args'] = cuda and {
+            desc = "CUDA argument capture: basic, all headers with CUPTI metadata, or none.",
+            arg = "<basic|all|none>",
+            arg_required = true,
+            default = "basic",
+        } or nil,
+        ['dump-cubins'] = cuda and {
+            desc            = "Save loaded CUDA module images, including JIT-compiled cubins.",
+            arg             = "<DIR>",
+            arg_required    = true,
+        } or nil,
         output = {
             desc            = "Output report filename.",
             sname           = "o",
@@ -57,7 +68,7 @@ consts_helper.profile = {
             arg_required    = true,
         },
         plugin = {
-            desc            = cuda and "Select the output plugin (msgpack or stdout)." or
+            desc            = cuda and "Select msgpack, stdout, or a custom CUDA output plugin library." or
                               "Specify the plugin path for RATELProf (options: msgpack, stdout, or custom path)",
             sname           = nil,
             arg             = "<PLUGIN>",
@@ -383,6 +394,20 @@ consts_helper.inspect = {
             desc = "Count static SASS instructions by opcode and kernel.",
             arg_required = false,
         } or nil,
+        ['pc-samples'] = cuda and {
+            desc = "Annotate SASS summaries with samples from a CUDA PC sampling JSON file.",
+            arg = "<FILE>",
+            arg_required = true,
+        } or nil,
+        linked = cuda and {
+            desc = "Inspect the ELF DT_NEEDED dependencies recursively.",
+            arg_required = false,
+        } or nil,
+        archs = cuda and {
+            desc = "Limit to a comma-separated list of CUDA architectures (e.g. sm_80,sm_90).",
+            arg = "<ARCH[,ARCH]>",
+            arg_required = true,
+        } or nil,
         output = {
             desc            = [[ 
                 Change the CSV output file.]],
@@ -424,6 +449,21 @@ consts_helper.visualize = {
         viewer = {
             desc = "Generate a WebGL report using a RATELProf-Visualize checkout.",
             arg = "<DIR>",
+            arg_required = true,
+        },
+        ["metrics-json"] = {
+            desc = "Show a ratelprof metrics JSON report in Statistics (requires --viewer).",
+            arg = "<FILE>",
+            arg_required = true,
+        },
+        ["pc-samples"] = {
+            desc = "Show a ratelprof sample JSON report in Statistics (requires --viewer).",
+            arg = "<FILE>",
+            arg_required = true,
+        },
+        ["source-csv"] = {
+            desc = "Show a ratelprof metrics --source SASS CSV in Statistics (requires --viewer).",
+            arg = "<FILE>",
             arg_required = true,
         },
         tmp = {

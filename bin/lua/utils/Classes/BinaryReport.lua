@@ -1,5 +1,6 @@
 -- BinaryReport.lua
 
+local SectionedReport = require("utils.SectionedReport")
 local BinaryReport = {}
 BinaryReport.__index = BinaryReport
 
@@ -25,6 +26,19 @@ end
 
 
 local function decode_rprof(rprof_rep)
+    local file = ratelprof.fs.open_file(rprof_rep, "rb")
+    if file:read(#SectionedReport.magic) == SectionedReport.magic then
+        file:seek("set", 0)
+        local contents = file:read("*a")
+        file:close()
+        local ok, data = pcall(SectionedReport.decode, contents)
+        if not ok then
+            Message:error("Cannot read sectioned report '" .. rprof_rep .. "': " .. data)
+            os.exit(1)
+        end
+        return data
+    end
+    file:close()
 
     local data = ratelprof.msgpack.decode(rprof_rep)
     local report_version = data.version
@@ -106,6 +120,7 @@ function BinaryReport:new(rprof_rep_files, opt)
 
     self.trace_events = {}
     self.lifecycle = {}
+    self.hosts_by_rank = {}
 
     self.locations = {}
     self.gpu_props = {}
@@ -134,6 +149,7 @@ function BinaryReport:new(rprof_rep_files, opt)
         self.rprof_rep_files[mpi_rank]  = rprof_rep_file
         self.trace_events[mpi_rank]     = data.trace_events or error("Missing trace events in report file: " .. rprof_rep_file)
         self.lifecycle[mpi_rank]        = data.lifecycle    or error("Missing lifecycle data in report file: " .. rprof_rep_file)
+        self.hosts_by_rank[mpi_rank]    = data.hostname
 
         self.locations = table.merge_map(self.locations, data.locations)
         local _, gpu = next(data.gpu_props)
@@ -158,6 +174,7 @@ function BinaryReport:to_json()
         experiment_start_epoch = self.experiment_start_epoch,
         trace_events           = self.trace_events,
         lifecycle              = self.lifecycle,
+        hosts_by_rank          = next(self.hosts_by_rank) and self.hosts_by_rank or nil,
         locations              = self.locations,
         node_id                = self.node_id,
         cuda_node_id_by_rank   = next(self.cuda_node_id_by_rank) and self.cuda_node_id_by_rank or nil,
@@ -306,7 +323,9 @@ function BinaryReport:__get_for_gpu(domain)
 
     local cond_func = nil
 
-    if domain == ratelprof.consts._ENV.DOMAIN_KERNEL or domain == ratelprof.consts._ENV.DOMAIN_CUDA_MEMSET then
+    if domain == ratelprof.consts._ENV.DOMAIN_KERNEL or domain == ratelprof.consts._ENV.DOMAIN_CUDA_MEMSET
+        or domain == ratelprof.consts._ENV.DOMAIN_MEMORY_FILL
+        or domain == ratelprof.consts._ENV.DOMAIN_CUDA_EVENT then
         cond_func = function(obj, trace, rank)
             return obj:get_gpu_id(trace.args.gpu_id, rank) == obj.__current_gpu
         end
@@ -413,8 +432,10 @@ function BinaryReport:find_entry_point(trace)
         error("A trace need to have an MPI rank attribute, even if it's -1.")
     end
     local parent_trace, parent_domain = self:find_parent_trace(entry_point, mpi_rank)
+    local visited = {[trace] = true}
 
-    while parent_trace do
+    while parent_trace and not visited[parent_trace] do
+        visited[parent_trace] = true
         entry_point = parent_trace
         entry_point_domain = parent_domain
         parent_trace, parent_domain = self:find_parent_trace(entry_point, mpi_rank)
@@ -425,7 +446,7 @@ end
 
 function BinaryReport:get_gpu_id(handle, rank)
     local map = self.cuda_node_id_by_rank[rank or self._current_rank] or self.node_id
-    return map[handle] or string.format('Unknown (%lu)', handle)
+    return map[handle] or string.format('Unknown (%s)', tostring(handle))
 end
 
 
@@ -490,7 +511,7 @@ end
 
 function BinaryReport:get_active_gpu_time()
     local E = ratelprof.consts._ENV
-    return self:compute_total_covered_duration(E.DOMAIN_KERNEL, E.DOMAIN_COPY, E.DOMAIN_CUDA_MEMSET)
+    return self:compute_total_covered_duration(E.DOMAIN_KERNEL, E.DOMAIN_COPY, E.DOMAIN_CUDA_MEMSET, E.DOMAIN_MEMORY_FILL)
 end
 
 function BinaryReport:get_not_hidden_active_copy_time()

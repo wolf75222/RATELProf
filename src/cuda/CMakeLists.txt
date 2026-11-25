@@ -6,16 +6,39 @@ if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.2)
     message(FATAL_ERROR "Select CUDA 12.9, 13.0 or 13.1 with CUDAToolkit_ROOT")
 endif()
 find_package(Threads REQUIRED)
+find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
+find_program(RATELPROF_CLANG clang)
+option(RATELPROF_CUDA_FULL_HOST_WRAPPERS "Generate host wrappers from the installed SDK headers" ON)
+
+get_target_property(CUPTI_INCLUDE_DIRS CUDA::cupti INTERFACE_INCLUDE_DIRECTORIES)
+find_path(RATELPROF_CUPTI_META_DIR cupti_driver_cbid.h HINTS ${CUPTI_INCLUDE_DIRS}
+    "${CUDAToolkit_LIBRARY_ROOT}/extras/CUPTI/include" NO_DEFAULT_PATH REQUIRED)
+
+set(CUPTI_ARGUMENT_TABLE "${CMAKE_CURRENT_BINARY_DIR}/cupti_arguments.inc")
+add_custom_command(OUTPUT "${CUPTI_ARGUMENT_TABLE}"
+    COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/generate_cupti_arguments.py"
+        "${RATELPROF_CUPTI_META_DIR}" "${CUPTI_ARGUMENT_TABLE}"
+    DEPENDS generate_cupti_arguments.py
+        "${RATELPROF_CUPTI_META_DIR}/cupti_driver_cbid.h"
+        "${RATELPROF_CUPTI_META_DIR}/cupti_runtime_cbid.h"
+        "${RATELPROF_CUPTI_META_DIR}/generated_cuda_meta.h"
+        "${RATELPROF_CUPTI_META_DIR}/generated_cuda_runtime_api_meta.h"
+    VERBATIM)
 
 set(MSGPACK_DIR "${PROJECT_SOURCE_DIR}/src/common/memory_structure")
 add_library(ratelprof_cuda SHARED
     collector.cpp
+    cupti_arguments.cpp
+    module_capture.cpp
+    output_plugin.cpp
+    "${CUPTI_ARGUMENT_TABLE}"
     "${MSGPACK_DIR}/msgpack.c"
     "${MSGPACK_DIR}/msgpack_ext.c"
 )
 target_compile_features(ratelprof_cuda PRIVATE cxx_std_17)
 target_compile_options(ratelprof_cuda PRIVATE -Wall -Wextra)
-target_include_directories(ratelprof_cuda PRIVATE "${MSGPACK_DIR}" "${PROJECT_SOURCE_DIR}/src/tools")
+target_include_directories(ratelprof_cuda PRIVATE "${MSGPACK_DIR}" "${PROJECT_SOURCE_DIR}/src/tools"
+    "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(ratelprof_cuda PRIVATE CUDA::cupti Threads::Threads ${CMAKE_DL_LIBS})
 
 function(add_host_trace library)
@@ -25,6 +48,34 @@ function(add_host_trace library)
     target_link_libraries(${library} PRIVATE ratelprof_cuda ${CMAKE_DL_LIBS})
     set_target_properties(${library} PROPERTIES INSTALL_RPATH "$ORIGIN")
     install(TARGETS ${library} LIBRARY DESTINATION lib)
+endfunction()
+
+function(enable_host_signatures library domain prefix)
+    if(NOT RATELPROF_CLANG OR NOT RATELPROF_CUDA_FULL_HOST_WRAPPERS)
+        return()
+    endif()
+
+    set(arguments --clang "${RATELPROF_CLANG}" --domain "${domain}" --prefix "${prefix}")
+    foreach(header IN LISTS ARGN)
+        list(APPEND arguments --header "${header}")
+    endforeach()
+    get_target_property(includes ${library} INCLUDE_DIRECTORIES)
+    if(includes)
+        foreach(directory IN LISTS includes)
+            list(APPEND arguments --include "${directory}")
+        endforeach()
+    endif()
+    set(script "${CMAKE_CURRENT_SOURCE_DIR}/generate_host_wrappers.py")
+    set(generated "${CMAKE_CURRENT_BINARY_DIR}/${library}_wrappers.inc")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${script}")
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${script}" ${arguments} --output "${generated}"
+        RESULT_VARIABLE status OUTPUT_VARIABLE summary ERROR_VARIABLE details OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(status EQUAL 0)
+        target_compile_definitions(${library} PRIVATE RATELPROF_GENERATED_HOST_WRAPPERS="${generated}")
+        message(STATUS "${summary}")
+    else()
+        message(WARNING "Using the hand-written ${domain} wrapper set. ${details}")
+    endif()
 endfunction()
 
 add_host_trace(ratelprof_cuda_omp)
@@ -37,6 +88,7 @@ if(RATELPROF_CUDA_CUBLAS)
         add_host_trace(ratelprof_cuda_cublas)
         target_compile_definitions(ratelprof_cuda_cublas PRIVATE RATELPROF_CUDA_CUBLAS)
         target_include_directories(ratelprof_cuda_cublas PRIVATE ${RATELPROF_CUBLAS_INCLUDE_DIR})
+        enable_host_signatures(ratelprof_cuda_cublas Cublas cublas cublas_v2.h cublasLt.h)
         target_compile_definitions(ratelprof_cuda PRIVATE RATELPROF_CUDA_CUBLAS)
         message(STATUS "CUDA backend: cuBLAS tracing enabled")
     endif()
@@ -51,6 +103,7 @@ if(RATELPROF_CUDA_NCCL)
         target_compile_definitions(ratelprof_cuda_nccl PRIVATE RATELPROF_CUDA_NCCL)
         target_include_directories(ratelprof_cuda_nccl PRIVATE
             ${RATELPROF_NCCL_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+        enable_host_signatures(ratelprof_cuda_nccl Nccl nccl nccl.h)
         target_compile_definitions(ratelprof_cuda PRIVATE RATELPROF_CUDA_NCCL)
         message(STATUS "CUDA backend: NCCL tracing enabled")
     endif()
@@ -63,15 +116,20 @@ if(RATELPROF_CUDA_MPI)
         add_host_trace(ratelprof_cuda_mpi)
         target_compile_definitions(ratelprof_cuda_mpi PRIVATE RATELPROF_CUDA_MPI)
         target_include_directories(ratelprof_cuda_mpi PRIVATE ${MPI_C_INCLUDE_DIRS})
+        enable_host_signatures(ratelprof_cuda_mpi Mpi MPI_ mpi.h)
         target_compile_definitions(ratelprof_cuda PRIVATE RATELPROF_CUDA_MPI)
         message(STATUS "CUDA backend: MPI tracing enabled")
     endif()
 endif()
 
-find_program(RATELPROF_CLANG clang)
 if(RATELPROF_CLANG)
     execute_process(COMMAND "${RATELPROF_CLANG}" -print-resource-dir
         OUTPUT_VARIABLE RATELPROF_CLANG_RESOURCE OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(EXISTS "${RATELPROF_CLANG_RESOURCE}/include/omp.h")
+        set(omp_header "${RATELPROF_CLANG_RESOURCE}/include/omp.h")
+        target_compile_definitions(ratelprof_cuda_omp PRIVATE RATELPROF_OMP_HEADER="${omp_header}")
+        enable_host_signatures(ratelprof_cuda_omp OmpRoutine omp_ "${omp_header}")
+    endif()
 endif()
 find_path(RATELPROF_OMPT_INCLUDE_DIR omp-tools.h HINTS "${RATELPROF_CLANG_RESOURCE}/include")
 if(RATELPROF_OMPT_INCLUDE_DIR)
@@ -92,3 +150,4 @@ endif()
 set_target_properties(ratelprof_cuda PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 install(TARGETS ratelprof_cuda LIBRARY DESTINATION lib)
+install(FILES ratelprof_cuda_plugin.h DESTINATION include)

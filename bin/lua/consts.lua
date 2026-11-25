@@ -61,6 +61,9 @@ consts._ENV = {
       DOMAIN_PROFILING =    "RATELPROF_DOMAIN_PROFILING",
       DOMAIN_OMPT =         "RATELPROF_DOMAIN_OMP_REGION",
       DOMAIN_ROCTX =        "RATELPROF_DOMAIN_ROCTX",
+      DOMAIN_ROCBLAS =      "RATELPROF_DOMAIN_ROCBLAS",
+      DOMAIN_RCCL =         "RATELPROF_DOMAIN_RCCL",
+      DOMAIN_MEMORY_FILL =  "RATELPROF_DOMAIN_MEMORY_FILL",
       DOMAIN_MPI =          "RATELPROF_DOMAIN_MPI",
     }
 
@@ -76,6 +79,9 @@ consts._DOMAIN_NAME = {
   [consts._ENV.DOMAIN_PROFILING]    = "HSA for RATELProf",
   [consts._ENV.DOMAIN_OMPT]         = "OpenMP Target Region",
   [consts._ENV.DOMAIN_ROCTX]        = "ROCtx",
+  [consts._ENV.DOMAIN_ROCBLAS]      = "rocBLAS API",
+  [consts._ENV.DOMAIN_RCCL]         = "RCCL API",
+  [consts._ENV.DOMAIN_MEMORY_FILL]  = "Memory Fill",
   [consts._ENV.DOMAIN_MPI]          = "MPI API",
 }
 
@@ -84,6 +90,7 @@ local cuda_domains = {
   CUDA_DRIVER = "CUDA Driver API",
   CUDA_MEMSET = "CUDA Memset",
   CUDA_SYNC = "CUDA Synchronization",
+  CUDA_EVENT = "CUDA Event Record",
   NVTX = "NVTX",
   CUBLAS = "cuBLAS API",
   NCCL = "NCCL API",
@@ -100,6 +107,8 @@ consts._GPU_DOMAIN = {
   [consts._ENV.DOMAIN_KERNEL]       = true,
   [consts._ENV.DOMAIN_COPY]         = true,
   [consts._ENV.DOMAIN_CUDA_MEMSET]  = true,
+  [consts._ENV.DOMAIN_CUDA_EVENT]   = true,
+  [consts._ENV.DOMAIN_MEMORY_FILL]  = true,
 }
 
 consts._DOMAIN_DESC = {
@@ -172,7 +181,7 @@ if consts._BACKEND == "cuda" then
     traces["cuda-runtime"] = {var=E.DOMAIN_CUDA_RUNTIME, name=cuda_domains.CUDA_RUNTIME}
     traces["cuda-driver"] = {var=E.DOMAIN_CUDA_DRIVER, name=cuda_domains.CUDA_DRIVER}
     traces["nvtx"] = {var=E.DOMAIN_NVTX, name=cuda_domains.NVTX}
-    traces["barrier"] = {var=E.DOMAIN_CUDA_SYNC, name=cuda_domains.CUDA_SYNC}
+    traces["barrier"] = {var={E.DOMAIN_CUDA_SYNC, E.DOMAIN_CUDA_EVENT}, name=cuda_domains.CUDA_SYNC}
     traces["memset"] = {var=E.DOMAIN_CUDA_MEMSET, name=cuda_domains.CUDA_MEMSET}
     traces["cpu"].var = {E.DOMAIN_CUDA_RUNTIME, E.DOMAIN_CUDA_DRIVER, E.DOMAIN_MPI,
                          E.DOMAIN_OMP_TGT, E.DOMAIN_OMP_TGT_RTL, E.DOMAIN_OMPT}
@@ -189,7 +198,8 @@ if consts._BACKEND == "cuda" then
             consts._CUDA_LIBRARY_WRAPPERS[domain] = library
         end
     end
-    traces["gpu"].var = {E.DOMAIN_KERNEL, E.DOMAIN_COPY, E.DOMAIN_CUDA_MEMSET, E.DOMAIN_CUDA_SYNC}
+    traces["gpu"].var = {E.DOMAIN_KERNEL, E.DOMAIN_COPY, E.DOMAIN_CUDA_MEMSET,
+                         E.DOMAIN_CUDA_SYNC, E.DOMAIN_CUDA_EVENT}
     traces["all"].var = {E.DOMAIN_NVTX}
     for _, group in ipairs({"cpu", "gpu"}) do
         for _, var in ipairs(traces[group].var) do

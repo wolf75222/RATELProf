@@ -10,7 +10,7 @@ local BinaryReport  = require ("utils.Classes.BinaryReport")
 
 local visualize = {}
 
-local function webgl(data, output, options)
+local function webgl(data, output, options, measurements)
     local quote = ratelprof.utils.shell_quote
     local directory = ratelprof.utils.execute_command("mktemp -d")
     if directory == "" then error("Could not create a temporary WebGL export directory") end
@@ -24,6 +24,7 @@ local function webgl(data, output, options)
             summary = JSON:decode(main_panel.get_summary_data_as_js_string(summary, analyzed)),
             statistics = statistics[-1] or {},
             analyze = rules[-1] or {},
+            measurements = measurements,
             domains = ratelprof.consts._DOMAIN_NAME,
             start = tonumber(options.start),
             stop = tonumber(options.stop),
@@ -44,6 +45,17 @@ local function webgl(data, output, options)
 end
 
 function visualize.process_visualizing(positional_args, options_values)
+    local measurements = {}
+    for _, name in ipairs({"metrics-json", "pc-samples", "source-csv"}) do
+        if options_values[name] then
+            if not options_values.viewer then
+                Message:error("--"..name.." requires --viewer")
+                os.exit(1)
+            end
+            measurements[name] = options_values[name]
+        end
+    end
+
     local data = BinaryReport:new(positional_args, {
         start = tonumber(options_values.start),
         stop = tonumber(options_values.stop)
@@ -57,7 +69,7 @@ function visualize.process_visualizing(positional_args, options_values)
         end
     end
     if options_values.viewer then
-        webgl(data, output, options_values)
+        webgl(data, output, options_values, measurements)
         return
     end
     local tmp_dir        = ratelprof.get_opt_val(options_values, "tmp")

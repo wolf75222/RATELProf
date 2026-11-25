@@ -25,6 +25,9 @@ extern "C" {
 }
 #include "version.h"
 #include "host_trace.h"
+#include "cupti_arguments.h"
+#include "module_capture.h"
+#include "output_plugin.h"
 
 namespace {
 
@@ -39,10 +42,10 @@ using KernelRecord = CUpti_ActivityKernel9;
 using ContextRecord = CUpti_ActivityContext3;
 #endif
 
-enum Domain { Runtime, Driver, Kernel, Copy, Memset, Sync, Nvtx, MpiHost,
+enum Domain { Runtime, Driver, Kernel, Copy, Memset, Sync, CudaEvent, Nvtx, MpiHost,
               OmpRoutineHost, OmpTargetHost, OmptHost, CublasHost, NcclHost, DomainCount };
 constexpr const char *domains[] = {
-    "CUDA_RUNTIME", "CUDA_DRIVER", "KERNEL", "COPY", "CUDA_MEMSET", "CUDA_SYNC", "NVTX",
+    "CUDA_RUNTIME", "CUDA_DRIVER", "KERNEL", "COPY", "CUDA_MEMSET", "CUDA_SYNC", "CUDA_EVENT", "NVTX",
     "MPI", "OMP_ROUTINE", "OMP_TGT_RTL", "OMP_REGION", "CUBLAS", "NCCL"
 };
 constexpr Domain host_domains[] = {MpiHost, OmpRoutineHost, OmpTargetHost, OmptHost, CublasHost, NcclHost};
@@ -65,9 +68,11 @@ struct Event {
     uint32_t src_kind = 0, dst_kind = 0;
     uint32_t local = 0, shared = 0, registers = 0, value = 0;
     uint32_t result = 0, cuda_event = unknown;
+    uint64_t event_sync = unknown;
     uint64_t graph_node = 0;
     uintptr_t caller = 0;
-    int64_t host_result = 0;
+    ArgumentValue host_result = int64_t{0};
+    TraceArguments host_arguments;
     bool has_host_result = false;
     std::array<int32_t, 3> grid{}, block{};
     std::string name, marker_domain;
@@ -81,20 +86,23 @@ struct Device {
     uint64_t memory = 0;
 };
 
-struct Argument {
-    const char *name;
-    const char *type;
-    uint64_t value;
+struct EventRecording {
+    uint32_t device, context, stream;
+    uint64_t timestamp;
 };
+
+enum class ArgumentMode { None, Basic, Full };
 
 struct Trace {
     std::mutex mutex;
     std::array<std::vector<Event>, DomainCount> events;
     std::map<uint32_t, Device> devices;
     std::unordered_map<uint32_t, uint32_t> contexts;
+    std::unordered_map<uint64_t, EventRecording> cuda_events;
     std::unordered_map<uint32_t, Event> markers;
     std::unordered_map<uint32_t, uint64_t> early_marker_ends;
-    std::unordered_map<uint64_t, std::vector<Argument>> arguments;
+    std::unordered_map<uint64_t, TraceArguments> arguments;
+    ArgumentMode argument_mode = ArgumentMode::Basic;
     std::atomic<uint64_t> dropped{0};
     std::atomic<bool> accepting_host{true};
     std::array<bool, DomainCount> enabled_domains{};
@@ -106,6 +114,7 @@ struct Trace {
     int result = 0;
     pid_t pid = getpid();
     bool registered = false;
+    bool capture_modules = false;
 };
 
 Trace *trace = nullptr;
@@ -180,67 +189,52 @@ uint64_t api_id(Domain domain, uint32_t correlation)
 void CUPTIAPI api_arguments(void *, CUpti_CallbackDomain domain, CUpti_CallbackId callback,
                             const void *data)
 {
+    if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
+        if (callback == CUPTI_CBID_RESOURCE_MODULE_LOADED && getpid() == trace->pid)
+            capture_cuda_module(data);
+        return;
+    }
+    if (domain != CUPTI_CB_DOMAIN_RUNTIME_API && domain != CUPTI_CB_DOMAIN_DRIVER_API)
+        return;
     const auto &call = *static_cast<const CUpti_CallbackData *>(data);
     if (call.callbackSite != CUPTI_API_ENTER || !call.functionParams || getpid() != trace->pid)
         return;
     const auto trace_domain = domain == CUPTI_CB_DOMAIN_RUNTIME_API ? Runtime : Driver;
-    if (!keep(trace_domain, call.functionName))
+    if (call.functionName && !keep(trace_domain, call.functionName))
         return;
 
-    std::vector<Argument> args;
-    if (trace_domain == Driver) {
-        const auto &p = *static_cast<const cuLaunchKernel_params *>(call.functionParams);
-        args = {{"grid_x", "uint32_t", p.gridDimX}, {"grid_y", "uint32_t", p.gridDimY},
-                {"grid_z", "uint32_t", p.gridDimZ}, {"block_x", "uint32_t", p.blockDimX},
-                {"block_y", "uint32_t", p.blockDimY}, {"block_z", "uint32_t", p.blockDimZ},
-                {"shared_bytes", "uint32_t", p.sharedMemBytes},
-                {"stream", "CUstream", reinterpret_cast<uintptr_t>(p.hStream)}};
-    } else {
-        switch (callback) {
-        case CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000: {
-            const auto &p = *static_cast<const cudaLaunchKernel_v7000_params *>(call.functionParams);
-            args = {{"grid_x", "uint32_t", p.gridDim.x}, {"grid_y", "uint32_t", p.gridDim.y},
-                    {"grid_z", "uint32_t", p.gridDim.z}, {"block_x", "uint32_t", p.blockDim.x},
-                    {"block_y", "uint32_t", p.blockDim.y}, {"block_z", "uint32_t", p.blockDim.z},
-                    {"shared_bytes", "size_t", p.sharedMem},
-                    {"stream", "cudaStream_t", reinterpret_cast<uintptr_t>(p.stream)}};
-            break;
-        }
-        case CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020: {
-            const auto &p = *static_cast<const cudaMemcpy_v3020_params *>(call.functionParams);
-            args = {{"bytes", "size_t", p.count}, {"kind", "cudaMemcpyKind", static_cast<uint64_t>(p.kind)}};
-            break;
-        }
-        case CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyAsync_v3020: {
-            const auto &p = *static_cast<const cudaMemcpyAsync_v3020_params *>(call.functionParams);
-            args = {{"bytes", "size_t", p.count}, {"kind", "cudaMemcpyKind", static_cast<uint64_t>(p.kind)},
-                    {"stream", "cudaStream_t", reinterpret_cast<uintptr_t>(p.stream)}};
-            break;
-        }
-        case CUPTI_RUNTIME_TRACE_CBID_cudaMemsetAsync_v3020: {
-            const auto &p = *static_cast<const cudaMemsetAsync_v3020_params *>(call.functionParams);
-            args = {{"bytes", "size_t", p.count}, {"value", "byte", static_cast<uint8_t>(p.value)},
-                    {"stream", "cudaStream_t", reinterpret_cast<uintptr_t>(p.stream)}};
-            break;
-        }
-        case CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020: {
-            const auto &p = *static_cast<const cudaMalloc_v3020_params *>(call.functionParams);
-            args = {{"bytes", "size_t", p.size}};
-            break;
-        }
-        default: return;
-        }
-    }
+    TraceArguments args = cupti_arguments(domain, callback, call.functionParams);
+    if (args.empty())
+        return;
     std::lock_guard<std::mutex> guard(trace->mutex);
     trace->arguments.emplace(api_id(trace_domain, call.correlationId), std::move(args));
 }
 
 void enable_api_arguments()
 {
-    if (!enabled(Runtime) && !enabled(Driver))
+    const bool capture = trace->argument_mode != ArgumentMode::None && (enabled(Runtime) || enabled(Driver));
+    if (!capture && !trace->capture_modules)
         return;
     if (!check(cuptiSubscribe(&trace->subscriber, api_arguments, nullptr), "subscribe to CUDA API arguments"))
         return;
+    if (trace->capture_modules) {
+        check(cuptiEnableCallback(1, trace->subscriber, CUPTI_CB_DOMAIN_RESOURCE,
+                                  CUPTI_CBID_RESOURCE_MODULE_LOADED),
+              "enable loaded CUDA module capture");
+    }
+    if (!capture)
+        return;
+    if (trace->argument_mode == ArgumentMode::Full) {
+        if (enabled(Runtime)) {
+            check(cuptiEnableDomain(1, trace->subscriber, CUPTI_CB_DOMAIN_RUNTIME_API),
+                  "enable all CUDA Runtime API arguments");
+        }
+        if (enabled(Driver)) {
+            check(cuptiEnableDomain(1, trace->subscriber, CUPTI_CB_DOMAIN_DRIVER_API),
+                  "enable all CUDA Driver API arguments");
+        }
+        return;
+    }
     if (enabled(Runtime)) {
         for (auto callback : {CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000,
                               CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020,
@@ -426,7 +420,26 @@ void collect(const CUpti_Activity *activity)
         event.context = record.contextId;
         event.stream = record.streamId;
         event.cuda_event = record.cudaEventId;
+        event.event_sync = record.cudaEventSyncId;
         event.result = record.returnValue;
+        add(std::move(event));
+        break;
+    }
+    case CUPTI_ACTIVITY_KIND_CUDA_EVENT: {
+        const auto &record = *reinterpret_cast<const CUpti_ActivityCudaEvent2 *>(activity);
+        if (record.cudaEventSyncId != unknown) {
+            trace->cuda_events.insert_or_assign(record.cudaEventSyncId,
+                EventRecording{record.deviceId, record.contextId, record.streamId,
+                               record.deviceTimestamp});
+        }
+        Event event(CudaEvent, record.deviceTimestamp, record.deviceTimestamp);
+        event.name = "CUDA event record";
+        event.correlation = record.correlationId;
+        event.context = record.contextId;
+        event.stream = record.streamId;
+        event.device = record.deviceId;
+        event.cuda_event = record.eventId;
+        event.event_sync = record.cudaEventSyncId;
         add(std::move(event));
         break;
     }
@@ -490,7 +503,7 @@ void enable(CUpti_ActivityKind kind, const char *name)
 
 void initialize_cupti()
 {
-    bool requested = false;
+    bool requested = trace->capture_modules;
     for (unsigned i = Runtime; i <= Nvtx; ++i)
         requested |= enabled(static_cast<Domain>(i));
     if (!requested)
@@ -526,6 +539,12 @@ void initialize_cupti()
         enable(CUPTI_ACTIVITY_KIND_MEMSET, "memset activity");
     if (enabled(Sync))
         enable(CUPTI_ACTIVITY_KIND_SYNCHRONIZATION, "synchronization activity");
+    if (enabled(CudaEvent)) {
+#if CUDA_VERSION >= 13000
+        check(cuptiActivityEnableCudaEventDeviceTimestamps(1), "CUDA event device timestamps");
+#endif
+        enable(CUPTI_ACTIVITY_KIND_CUDA_EVENT, "CUDA event activity");
+    }
     if (enabled(Nvtx))
         enable(CUPTI_ACTIVITY_KIND_MARKER, "NVTX marker activity");
     enable_api_arguments();
@@ -549,6 +568,32 @@ void dimensions(msgpack_buffer_t &buf, const char *name, const std::array<int32_
     msgpack_encode_array(&buf, xyz.size());
     for (auto dim : xyz)
         msgpack_encode_int(&buf, dim);
+}
+
+void argument(msgpack_buffer_t &buf, const TraceArgument &arg)
+{
+    msgpack_encode_string_ext(&buf, arg.name);
+    msgpack_encode_map(&buf, 2);
+    field(buf, "type", arg.type.c_str());
+    msgpack_encode_string_ext(&buf, "value");
+    std::visit([&](const auto &value) {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, uint64_t>)
+            msgpack_encode_uint(&buf, value);
+        else if constexpr (std::is_same_v<T, int64_t>)
+            msgpack_encode_int(&buf, value);
+        else if constexpr (std::is_same_v<T, double>)
+            msgpack_encode_double(&buf, value);
+        else if constexpr (std::is_same_v<T, bool>)
+            msgpack_encode_bool(&buf, value);
+        else if constexpr (std::is_same_v<T, std::string>)
+            msgpack_encode_string_ext(&buf, value.c_str());
+        else {
+            msgpack_encode_array(&buf, value.size());
+            for (auto component : value)
+                msgpack_encode_uint(&buf, component);
+        }
+    }, arg.value);
 }
 
 void argument(msgpack_buffer_t &buf, const char *name, uint64_t value, const char *type)
@@ -598,7 +643,8 @@ const Event *find_api(const ApiEvents &runtime, const ApiEvents &driver, const E
 
 void encode_event(msgpack_buffer_t &buf, const Event &event, const Event *api)
 {
-    const bool gpu = event.domain == Kernel || event.domain == Copy || event.domain == Memset;
+    const bool gpu = event.domain == Kernel || event.domain == Copy ||
+                     event.domain == Memset || event.domain == CudaEvent;
     msgpack_encode_map(&buf, gpu ? 6 : 9 + (event.caller != 0));
     field(buf, "phase", phase(event.start));
     field(buf, "corr_id", api ? api_id(api->domain, api->correlation) : 0);
@@ -648,14 +694,34 @@ void encode_event(msgpack_buffer_t &buf, const Event &event, const Event *api)
         break;
     case Sync: {
         auto device = trace->contexts.find(event.context);
-        msgpack_encode_map(&buf, 5);
+        auto recording = trace->cuda_events.find(event.event_sync);
+        const bool matched = recording != trace->cuda_events.end();
+        const bool timestamped = matched && recording->second.timestamp != 0;
+        msgpack_encode_map(&buf, 5 + (event.event_sync != unknown) + (matched ? 3 : 0) + timestamped);
         argument(buf, "context_id", event.context, "uint32_t");
         argument(buf, "stream_id", event.stream, "uint32_t");
         argument(buf, "event_id", event.cuda_event, "uint32_t");
         argument(buf, "device_id", device == trace->contexts.end() ? unknown : device->second, "uint32_t");
         argument(buf, "retval", event.result, "CUDA result");
+        if (event.event_sync != unknown)
+            argument(buf, {"event_sync_id", "uint64_t", trace_argument_value(event.event_sync)});
+        if (matched) {
+            argument(buf, "record_device_id", recording->second.device, "uint32_t");
+            argument(buf, "record_context_id", recording->second.context, "uint32_t");
+            argument(buf, "record_stream_id", recording->second.stream, "uint32_t");
+        }
+        if (timestamped)
+            argument(buf, "record_time_ns", relative(recording->second.timestamp), "uint64_t");
         break;
     }
+    case CudaEvent:
+        msgpack_encode_map(&buf, 5);
+        field(buf, "gpu_id", event.device);
+        field(buf, "context_id", event.context);
+        field(buf, "queue_id", event.stream);
+        field(buf, "event_id", event.cuda_event);
+        field(buf, "event_sync_id", event.event_sync);
+        break;
     case Memset:
         msgpack_encode_map(&buf, 7);
         field(buf, "context_id", event.context);
@@ -676,21 +742,18 @@ void encode_event(msgpack_buffer_t &buf, const Event &event, const Event *api)
     case OmptHost:
     case CublasHost:
     case NcclHost:
-        msgpack_encode_map(&buf, event.has_host_result);
-        if (event.has_host_result) {
-            msgpack_encode_string_ext(&buf, "retval");
-            msgpack_encode_map(&buf, 2);
-            field(buf, "type", "integer");
-            msgpack_encode_string_ext(&buf, "value");
-            msgpack_encode_int(&buf, event.host_result);
-        }
+        msgpack_encode_map(&buf, event.host_arguments.size() + event.has_host_result);
+        for (const auto &arg : event.host_arguments)
+            argument(buf, arg);
+        if (event.has_host_result)
+            argument(buf, {"retval", "return value", event.host_result});
         break;
     default: {
         auto args = trace->arguments.find(api_id(event.domain, event.correlation));
         msgpack_encode_map(&buf, 1 + (args == trace->arguments.end() ? 0 : args->second.size()));
         if (args != trace->arguments.end()) {
             for (const auto &arg : args->second)
-                argument(buf, arg.name, arg.value, arg.type);
+                argument(buf, arg);
         }
         argument(buf, "retval", event.result, "CUDA result");
         break;
@@ -700,13 +763,17 @@ void encode_event(msgpack_buffer_t &buf, const Event &event, const Event *api)
 
 int mpi_rank()
 {
-    for (const char *name : {"OMPI_COMM_WORLD_RANK", "PMI_RANK", "PMIX_RANK", "MV2_COMM_WORLD_RANK",
+    const char *slurm_tasks = std::getenv("SLURM_STEP_NUM_TASKS");
+    if (!slurm_tasks)
+        slurm_tasks = std::getenv("SLURM_NTASKS");
+    const char *mpi_tasks = std::getenv("PMI_SIZE");
+    const bool serial_step = slurm_tasks && std::strtol(slurm_tasks, nullptr, 10) == 1 &&
+                             (!mpi_tasks || std::strtol(mpi_tasks, nullptr, 10) <= 1);
+    unsigned source = 0;
+    for (const char *name : {"OMPI_COMM_WORLD_RANK", "MV2_COMM_WORLD_RANK", "PMI_RANK", "PMIX_RANK",
                              "SLURM_PROCID"}) {
-        if (std::strcmp(name, "SLURM_PROCID") == 0) {
-            const char *tasks = std::getenv("SLURM_NTASKS");
-            if (!tasks || std::strtol(tasks, nullptr, 10) < 2)
-                continue;
-        }
+        if (source++ >= 2 && serial_step)
+            break;
         if (const char *value = std::getenv(name)) {
             char *end = nullptr;
             long rank = std::strtol(value, &end, 10);
@@ -727,8 +794,9 @@ std::string report_path(int rank)
     return path;
 }
 
-void write_report(const std::string &path, int rank, uint64_t stop)
+bool write_report(const std::string &path, int rank, uint64_t stop)
 {
+    bool published = false;
     ApiEvents runtime, driver;
     for (const auto &event : trace->events[Runtime])
         runtime.emplace(event.correlation, &event);
@@ -757,7 +825,7 @@ void write_report(const std::string &path, int rank, uint64_t stop)
     // The report header stores the interned string table before the trace data.
     msgpack_buffer_t events{};
     if (msgpack_init(&events, 4096, MSGPACK_OVERFLOW_REALLOC, nullptr) != 0)
-        return;
+        return false;
     msgpack_ext_string_init();
     size_t domain_count = 0;
     for (const auto &group : trace->events)
@@ -863,6 +931,7 @@ void write_report(const std::string &path, int rank, uint64_t stop)
                 ok = false;
             if (ok && std::rename(temporary.c_str(), path.c_str()) == 0) {
                 std::fprintf(stderr, "RATELProf CUDA: wrote %s\n", path.c_str());
+                published = true;
             } else {
                 std::fprintf(stderr, "RATELProf CUDA: could not write %s\n", path.c_str());
             }
@@ -872,6 +941,7 @@ void write_report(const std::string &path, int rank, uint64_t stop)
     }
     msgpack_free(&events);
     msgpack_ext_string_free();
+    return published;
 }
 
 void finish()
@@ -888,14 +958,16 @@ void finish()
             cuptiActivityDisable(kind);
         check(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED), "flush remaining activities");
     }
+    if (trace->capture_modules)
+        finish_module_capture();
 
-    std::lock_guard<std::mutex> guard(trace->mutex);
     const int rank = mpi_rank();
     if (trace->dropped)
         std::fprintf(stderr, "RATELProf CUDA: CUPTI dropped %llu activity records\n",
                      static_cast<unsigned long long>(trace->dropped.load()));
     const char *plugin = std::getenv("RATELPROF_CUDA_PLUGIN");
     if (plugin && std::strcmp(plugin, "stdout") == 0) {
+        std::lock_guard<std::mutex> guard(trace->mutex);
         for (const auto &group : trace->events) {
             for (const auto &event : group) {
                 std::printf("%s\t%llu\t%llu\t%s\n", domains[event.domain],
@@ -904,7 +976,14 @@ void finish()
             }
         }
     } else {
-        write_report(report_path(rank), rank, stop);
+        const auto path = report_path(rank);
+        bool published;
+        {
+            std::lock_guard<std::mutex> guard(trace->mutex);
+            published = write_report(path, rank, stop);
+        }
+        if (published)
+            ratelprof_cuda_run_output_plugin(path.c_str(), rank, trace->pid, trace->result);
     }
 }
 
@@ -927,17 +1006,24 @@ uint64_t host_begin(HostDomain domain)
         ? timestamp() : 0;
 }
 
+bool host_arguments_enabled(HostDomain domain)
+{
+    return trace && trace->argument_mode == ArgumentMode::Full && enabled(host_domains[domain])
+        && trace->accepting_host && getpid() == trace->pid;
+}
+
 void host_end(HostDomain domain, const char *name, uint64_t start, const void *caller,
-              int64_t result, bool has_result)
+              ArgumentValue result, bool has_result, TraceArguments arguments, bool instantaneous)
 {
     if (!start || !trace || !trace->accepting_host || getpid() != trace->pid)
         return;
-    Event event(host_domains[domain], start, timestamp());
+    Event event(host_domains[domain], start, instantaneous ? start : timestamp());
     event.name = name;
     event.pid = trace->pid;
     event.tid = syscall(SYS_gettid);
     event.caller = reinterpret_cast<uintptr_t>(caller);
-    event.host_result = result;
+    event.host_result = std::move(result);
+    event.host_arguments = std::move(arguments);
     event.has_host_result = has_result;
     std::lock_guard<std::mutex> guard(trace->mutex);
     if (trace->accepting_host)
@@ -956,6 +1042,14 @@ extern "C" int __libc_start_main(Main main, int argc, char **argv, void (*init)(
         trace = new Trace;
         trace->start = timestamp();
         trace->epoch = clock_ns(CLOCK_REALTIME);
+        if (const char *directory = std::getenv("RATELPROF_DUMP_CUBINS"))
+            trace->capture_modules = init_module_capture(directory);
+        if (const char *mode = std::getenv("RATELPROF_CUDA_API_ARGS")) {
+            if (std::strcmp(mode, "all") == 0)
+                trace->argument_mode = ArgumentMode::Full;
+            else if (std::strcmp(mode, "none") == 0)
+                trace->argument_mode = ArgumentMode::None;
+        }
         const char *output = std::getenv("RATELPROF_OUTPUT_FILE");
         trace->output = output && *output ? output : "report.rprof-rep";
         if (trace->output.front() != '/') {

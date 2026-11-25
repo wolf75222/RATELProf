@@ -2,12 +2,13 @@
 
 ## NVIDIA CUDA backend
 
-This port keeps the report format from RATELProf `master` (`8e71397`) and
-adds selected features from `pre-release`, including the WebGL export and
-CPU/GPU breakdown.
+This port writes RATELProf `master`-format reports (`8e71397`) with CUDA
+domains. It also reads AMD sectioned `.rprof-rep` reports (version 1.1.1)
+from `pre-release` through the export, analysis and viewer commands.
 
-Build the CUDA backend on Linux with CMake 3.18+, LuaJIT or Lua 5.1, and the
-CUDA 12.9, 13.0 or 13.1 toolkit, including CUPTI and the CUDA binary utilities.
+Build the CUDA backend on Linux with CMake 3.18+, Python 3.8+, LuaJIT or Lua
+5.1, and the CUDA 12.9, 13.0 or 13.1 toolkit, including CUPTI and the CUDA
+binary utilities.
 Use a separate install prefix for each backend.
 
 ```sh
@@ -20,9 +21,11 @@ export PATH="$HOME/.local/ratelprof-cuda/bin:$PATH"
 
 If several toolkits are installed, pass `-DCUDAToolkit_ROOT=/path/to/cuda` to
 CMake and put that toolkit's `bin` directory on `PATH` for inspection. The
-default build remains ROCm. CMake discovers optional MPI and OMPT headers.
-Set `MPI_C_COMPILER` or `RATELPROF_OMPT_INCLUDE_DIR` if discovery needs a hint.
-MPI tracing uses the same MPI implementation and ABI as the application.
+default build remains ROCm. For full host signature generation, put Clang on
+`PATH` before configuring. CMake discovers optional MPI, OpenMP, cuBLAS, and
+NCCL headers. Set `MPI_C_COMPILER`, `RATELPROF_OMPT_INCLUDE_DIR`, or `NCCL_ROOT`
+if discovery needs a hint. MPI tracing uses the same MPI implementation and
+ABI as the application.
 
 ```sh
 ratelprof profile --trace gpu,cuda-runtime,cuda-driver,nvtx -o run.rprof-rep ./application -- --app-option
@@ -34,45 +37,80 @@ ratelprof visualize run.rprof-rep
 ratelprof export --type json run.rprof-rep
 ratelprof export --type arg-info run.rprof-rep
 ratelprof inspect --info gpu
-ratelprof inspect --save-json --sass --sass-summary ./application
+ratelprof inspect --linked --archs sm_90 --save-json --sass --sass-summary ./application
 ```
 
 - `profile` records CUDA Runtime and Driver calls, concurrent kernels, memory
   copies, peer copies, memsets, synchronization and NVTX ranges and marks.
   Kernel launches retain grid dimensions in blocks, block dimensions in
-  threads, registers per thread and shared memory. The CUDA equivalent of
-  `--trace barrier` records CUDA synchronization calls. Choose `--plugin
-  stdout` for text traces.
+  threads, registers per thread and shared memory. CUDA synchronization events
+  include the recorded stream and the waiting stream when CUPTI supplies their
+  matching IDs. CUDA 13 can emit device timestamps for event markers.
 - The whitelist and blacklist use the existing format. For example,
   `CUDA_RUNTIME: cudaMalloc cudaMemcpyAsync` selects those Runtime API calls.
-  CUDA argument export includes return codes and parameters for selected launch,
-  allocation, copy and memset APIs.
+  `--api-args basic` (default) traces the curated CUDA API set, `--api-args all`
+  traces the enabled Runtime and Driver callback domains and captures the
+  typed parameters available in the installed CUPTI headers, and
+  `--api-args none` keeps the curated trace with return codes only. Typed values
+  include scalars and common CUDA geometry structures. Pointers are recorded
+  as addresses, and unsupported by-value structures carry their size.
 - `inspect` reads kernel resources with `cuobjdump` and uses `nvdisasm` for
   SASS when available. `cuobjdump --dump-sass` is the fallback. The
   `RATELPROF_NVDISASM` environment variable can point to a compatible disassembler.
   `--sass-summary` counts static instructions by kernel and opcode in a
-  `.sass.json` file. The counts describe the binary. Execution frequencies and
-  latencies require runtime measurements. Inspection accepts a CUDA executable,
-  shared library or standalone cubin containing compiled device code. The GPU
-  query follows CUDA device visibility.
-- `--trace mpi` covers common C MPI calls. With
+  `.sass.json` file. `--linked` searches recursive ELF dependencies without
+  running the application. Use `--archs sm_80,sm_90` to restrict the images.
+  `profile --dump-cubins DIR` also captures modules loaded into CUDA, including
+  code generated from PTX at runtime. Inspect accepts executables, shared
+  libraries, and standalone cubins. GPU queries follow CUDA device visibility.
+- `--trace mpi` records the C MPI interface. With
   `--prefix='mpirun -np 2'`, each rank writes its own `rank_<n>_*.rprof-rep`.
-  Pass those files together to the report commands. `--trace omp` captures common
-  OpenMP target routines, OMPT regions, and target data and submit operations
-  when the OpenMP runtime provides those callbacks.
-- `--trace cublas,nccl` covers common cuBLAS, cuBLASLt and NCCL calls,
-  including GEMM and selected collectives. CMake enables the wrappers when
-  the corresponding headers are available. Use `-DNCCL_ROOT=/path/to/nccl`
-  when NCCL is installed in a separate prefix.
+  Pass those files together to the report commands. `--trace omp` captures
+  OpenMP API calls and the OMPT callbacks the runtime supports, including target
+  regions, memory transfers, submits, mappings, and device events.
+- `--trace cublas,nccl` records cuBLAS, cuBLASLt, and NCCL calls. With Clang and
+  SDK headers, CMake generates interposition for eligible C declarations in
+  these libraries, MPI, and OpenMP. `--api-args all` adds their signature
+  arguments. Inline, variadic, and unexported calls are outside that
+  interposition. A hand-written baseline is available without Clang or with
+  `-DRATELPROF_CUDA_FULL_HOST_WRAPPERS=OFF`.
+- `--plugin stdout` emits text traces. `--plugin ./my-plugin.so` runs a custom
+  output hook after the report is written. Implement the C ABI in the installed
+  `include/ratelprof_cuda_plugin.h` header.
 - `breakdown` reports active time by rank and by PID or GPU. It uses the
   union of observed event intervals to account for overlapping work and can
   export the tables as CSV or TSV.
 
-NVIDIA uses its own CUDA Driver and Runtime domains in place of HIP and HSA.
-Custom ROCm plugins, HSA barrier packets, exhaustive API arguments, PC sampling
-and hardware performance counters are outside the current NVIDIA backend.
-The collector profiles the directly launched Linux executable and writes the
-report at normal process exit.
+The collector writes the report at normal process exit. CUDA uses event and
+stream synchronization, while HSA barrier AND/OR packets remain specific to
+the AMD backend. Existing ROCm live plugins keep their AMD ABI.
+
+### Hardware counters and PC sampling
+
+`metrics` uses Nsight Compute CLI for hardware counters, including DRAM and
+cache traffic, achieved occupancy, and warp stalls. `--source` also exports
+the source/SASS page when the report contains it. Keep the `.ncu-rep` file to
+re-export it without running the application again.
+
+```sh
+ratelprof metrics -o counters --section SpeedOfLight -- ./application
+ratelprof metrics --import existing.ncu-rep -o counters --source
+ratelprof sample --period 10 --dump-cubins cubins -o pc.json ./application
+ratelprof inspect --pc-samples pc.json -o kernel.csv cubins/module.cubin
+```
+
+Compile with `-lineinfo` to make file and line correlation available when the
+cubin includes this information. `sample` uses CUPTI to collect instruction
+addresses and warp stall reasons in a dedicated run. `inspect --pc-samples`
+uses `nvdisasm` and joins by cubin CRC, kernel symbol, and instruction offset.
+It writes per-instruction sample counts into the `.sass.json` output for
+matched cubins. Substitute the actual cubin file saved in `cubins/`.
+
+Live hardware counters and PC sampling require performance counter access
+from the NVIDIA driver. Tool availability and supported metrics depend on
+the GPU and toolkit. GH200 Hopper is the validated hardware target. On ROMEO,
+the driver currently blocks live performance counter and PC sampling access.
+Offline import of NVIDIA Nsight Compute sample measurements works there.
 
 ### RATELProf-Visualize WebGL viewer
 
@@ -91,6 +129,16 @@ Breakdown, Statistics and Analyze views. Pass multiple rank reports to the
 same command to use the rank selector. The viewer loads deck.gl from its
 configured CDN and requires WebGL in the browser. The export was tested with
 RATELProf-Visualize revision `5a2d509`.
+
+To display the measurements in the Statistics panel, copy the sidecar files
+from the profiling host along with the trace report and add them to the export.
+The tables retain the identifiers of their own profiling runs.
+
+```sh
+ratelprof visualize --viewer ./RATELProf-Visualize -o webgl-report \
+    --metrics-json counters.metrics.json --source-csv counters.source.csv \
+    --pc-samples pc.json run.rprof-rep
+```
 
 ### CUDA smoke test
 

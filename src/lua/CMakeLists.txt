@@ -29,6 +29,8 @@ IF(RATELPROF_BACKEND STREQUAL "rocm")
 ELSE()
     ADD_LUA_LIBRARY(ratelprof_cuda_agent ratelprof_cuda_agent.c)
     TARGET_LINK_LIBRARIES(ratelprof_cuda_agent PRIVATE CUDA::cuda_driver)
+    ADD_LUA_LIBRARY(ratelprof_cubin ratelprof_cubin.c)
+    TARGET_LINK_LIBRARIES(ratelprof_cubin PRIVATE CUDA::cupti)
 ENDIF()
 
 
