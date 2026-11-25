@@ -6,18 +6,21 @@ function display_help() {
 Usage: ratelprof [--help] <command> [options] [command args] 
 
 Commands:
-  profile       Run an application and capture its profile into a json report file.
-  stats         Generate statistics from an existing json report file.
+  profile       Run an application and capture its profile into a .rprof-rep file.
+  stats         Generate statistics from an existing .rprof-rep file.
+  analyze       Run optimization rules on a profile.
+  breakdown     Break down CPU and GPU activity by rank, process and device.
   visualize     Generate a HTML Report Viewer to see the traces into a timeline.
   inspect       Inspect an application and output data about kernels from the application.
   summarize     Summarize global information/metrics about a profiling report.
+  export        Export a profiling report as JSON or function call information.
 
 Use '$(basename $0) <command> --help' for more information about a specific command.
 EOF
     exit 0
 }
 
-BIN_DIR=$(dirname $0)
+BIN_DIR=$(dirname "$0")
 LUA_DIR=$BIN_DIR/lua
 export LUA_PATH="$LUA_DIR/?.lua;;"
 export INSTALL_DIR="$(realpath "$BIN_DIR/..")"
@@ -46,18 +49,13 @@ fi
 CMD="$1"
 shift
 
-args=""
-for arg in "$@"; do
-    args="$args '$arg'"
-done
-
 case "$CMD" in
     --help|-h)
         display_help
         ;;
 
-    profile|stats|analyze|visualize|inspect|export|summarize)
-        eval "$LUA_EXEC $LUA_DIR/$CMD.lua $args"
+    profile|stats|analyze|breakdown|visualize|inspect|export|summarize)
+        exec "$LUA_EXEC" "$LUA_DIR/$CMD.lua" "$@"
         ;;
 
     *)

@@ -2,6 +2,8 @@ local env           = require ("commands.profile.env")
 local agent_helper  = require ("commands.inspect.agent_helper")
 
 local profile = {}
+local cuda = ratelprof.consts._BACKEND == "cuda"
+local quote = ratelprof.utils.shell_quote
 
 -- Function to handle the options for the profile command
 local function handle_profile_option(options)
@@ -17,17 +19,25 @@ local function handle_profile_option(options)
     local log_level = ratelprof.get_opt_val(options, "log-level")
     if log_level then env.set_env(ratelprof.consts._ENV.LOG_LEVEL, log_level) end
 
-    local enabled_domain = {}
-    local traces_list = ratelprof.get_opt_val(options, "trace"):split(",")
+    local enabled_domain, domain_flags = {}, {}
+    local function enable_domain(var)
+        if var then
+            domain_flags[var] = true
+            env.set_env(var, "1")
+        end
+    end
+    local traces = ratelprof.get_opt_val(options, "trace")
+    local traces_list = (cuda and traces:match("^%s*none%s*$")) and {"none"} or traces:split(",")
     for _, trace_name in ipairs(traces_list) do
+        trace_name = trace_name:trim()
         local trace = ratelprof.consts._TRACES[trace_name]
         if trace then
             if type(trace.var) == "table" then
                 for _, var in ipairs(trace.var) do
-                    env.set_env(var, "1")
+                    enable_domain(var)
                 end
             else
-                env.set_env(trace.var, "1")
+                enable_domain(trace.var)
             end
             table.insert(enabled_domain, trace.name)
         else
@@ -36,7 +46,13 @@ local function handle_profile_option(options)
     end
 
     local plugin_path = ratelprof.get_opt_val(options, "plugin")
-    if plugin_path then
+    if cuda then
+        if plugin_path ~= "msgpack" and plugin_path ~= "stdout" then
+            Message:error("CUDA profiling requires the msgpack or stdout plugin.")
+            os.exit(1)
+        end
+        env.set_env("RATELPROF_CUDA_PLUGIN", plugin_path)
+    elseif plugin_path then
         if plugin_path == "stdout"        then plugin_path = ratelprof.consts._LIBS.PLUGIN_STDOUT
         elseif plugin_path == "msgpack"   then plugin_path = ratelprof.consts._LIBS.PLUGIN_MSGPACK
         elseif plugin_path == "json"      then plugin_path = ratelprof.consts._LIBS.PLUGIN_JSON
@@ -48,8 +64,8 @@ local function handle_profile_option(options)
         env.set_env(ratelprof.consts._ENV.PLUGIN_PATH, plugin_path) 
     end
 
-    local launch_script     = ratelprof.get_opt_val(options, "launch_script")
-    local launch_command    = ratelprof.get_opt_val(options, "launch_command")
+    local launch_script     = ratelprof.get_opt_val(options, "launch-script")
+    local launch_command    = ratelprof.get_opt_val(options, "launch-command")
     local prefix            = ratelprof.get_opt_val(options, "prefix")
     
     return {
@@ -58,12 +74,13 @@ local function handle_profile_option(options)
         prefix = prefix,
         plugin = plugin_path,
         enabled_domain = enabled_domain,
+        domain_flags = domain_flags,
     }
 end
 
 
 local function normal_execution(cmd)
-    local ret_code = os.execute(cmd)
+    local ret_code = ratelprof.utils.exit_status(os.execute(cmd))
     if ret_code ~= 0 then
         Message:error("Application execution failed - code("..ret_code..").")
         Message:error("Run command : '"..cmd.."'")
@@ -77,12 +94,19 @@ local function script_execution(cmd, launch_command, launch_script)
     file:close()
     
     file = ratelprof.fs.open_file(launch_script..".tmp", "w")
-    file:write(script_content:gsub("<run_command>", cmd))
+    file:write((script_content:gsub("<run_command>", function() return cmd end)))
     file:close()
 
-    normal_execution(launch_command .. " " .. launch_script..".tmp")
+    normal_execution(launch_command .. " " .. quote(launch_script..".tmp"))
 end
 
+local function run_application(run_command, opt)
+    if opt.launch_script and opt.launch_command then
+        script_execution(run_command, opt.launch_command, opt.launch_script)
+    else
+        normal_execution(run_command)
+    end
+end
 
 function profile.process_profiling(positional_args, options_values)
     local application_command = positional_args
@@ -94,9 +118,41 @@ function profile.process_profiling(positional_args, options_values)
     local prefix            = opt.prefix .. " "
     local plugin_path       = opt.plugin
 
-    if not ratelprof.fs.exists(application) then
+    if not application or (not cuda and not ratelprof.fs.exists(application)) then
         Message:print("No application to profile or '"..application.."' doesn't exists.")
         os.exit(1)
+    end
+
+    local command = {}
+    for _, arg in ipairs(application_command) do
+        command[#command + 1] = quote(arg)
+    end
+    local app_cmd = table.concat(command, " ")
+
+    if cuda then
+        local libdir = ratelprof.consts._LIBS_DIR
+        local lib = libdir.."libratelprof_cuda.so"
+        local libraries = {lib}
+        local flags, E = opt.domain_flags, ratelprof.consts._ENV
+        if flags[E.DOMAIN_OMP_TGT] or flags[E.DOMAIN_OMPT] or flags[E.DOMAIN_OMP_TGT_RTL] then
+            libraries[#libraries + 1] = libdir.."libratelprof_cuda_omp.so"
+        end
+        local mpi = libdir.."libratelprof_cuda_mpi.so"
+        if flags[E.DOMAIN_MPI] and ratelprof.fs.exists(mpi) then
+            libraries[#libraries + 1] = mpi
+        end
+        for domain, library in pairs(ratelprof.consts._CUDA_LIBRARY_WRAPPERS) do
+            if flags[domain] then
+                libraries[#libraries + 1] = library
+            end
+        end
+        local inherited = os.getenv("LD_PRELOAD")
+        if inherited and inherited ~= "" then libraries[#libraries + 1] = inherited end
+        env.set_env("LD_PRELOAD", table.concat(libraries, ":"))
+        env.set_env("NVTX_INJECTION64_PATH", lib)
+        Message:print("RPROF: CUDA profiling enabled for "..table.concat(opt.enabled_domain, ", "))
+        run_application(prefix.."env -u RATELPROF_CUDA_OWNER "..env.get_env().." "..app_cmd, opt)
+        return
     end
     
     local ld_library_path = os.getenv ("LD_LIBRARY_PATH")
@@ -131,7 +187,6 @@ function profile.process_profiling(positional_args, options_values)
     env.set_env("LD_PRELOAD", table.concat(ld_preload, ":"))
 
     local env_var = env.get_env()
-    local app_cmd = table.concat(application_command, " ")
     local run_command = prefix.."env "..env_var.." "..app_cmd
 
     Message:print ([[
@@ -150,7 +205,7 @@ function profile.process_profiling(positional_args, options_values)
 
     if launch_command and launch_script and ratelprof.fs.exists(launch_script) then
         Message:print ("RPROF: Running :                 '"..launch_command.." "..launch_script.."'")
-        script_execution (run_command, launch_command, launch_script)
+        run_application(run_command, opt)
     else
         normal_execution (run_command)
     end

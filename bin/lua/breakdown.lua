@@ -1,0 +1,17 @@
+require("globals")
+local Script = require("utils.Classes.Script")
+local breakdown = require("commands.breakdown")
+
+local script = Script:new({name = "ratelprof breakdown", version = ratelprof.consts._VERSION})
+script:set_desc("Break down traced CPU activity and GPU execution time by rank, PID and device.")
+script:add_argument("report-file", false, true, "Path to one or more .rprof-rep files.")
+script:add_option("report", "r", "<name>[,<name>]", "Select cpu_breakdown and/or gpu_breakdown.",
+                  true, "cpu_breakdown,gpu_breakdown")
+script:add_option("output", "o", "<prefix>", "Write one file per breakdown. Use '-' for stdout.", true, "-")
+script:add_option("format", "f", "<format>", "Choose column, table, csv or tsv.", true)
+script:add_option("timeunit", nil, "<unit>", "Wall time unit (ns, us, ms, s).", true, "ms")
+script:add_option("start", nil, "<ns>", "Start of the analysis window, in nanoseconds.", true)
+script:add_option("stop", nil, "<ns>", "End of the analysis window, in nanoseconds.", true)
+script:add_option("only-main", nil, nil, "Restrict each rank to its main phase.")
+script:set_execute_function(breakdown.process)
+script:execute(arg)

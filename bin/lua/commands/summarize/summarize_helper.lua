@@ -6,6 +6,7 @@ local NCHAR_SEPARATOR = 72
 summarize_helper.NCHAR_SEPARATOR = NCHAR_SEPARATOR
 
 function summarize_helper.format_gpu_time(time, app_time)
+    if time == nil or app_time <= 0 then return "N/A" end
     local percentage = (time / app_time) * 100
     local time_s = ratelprof.convert.time(time, "ns", "sec")
     return string.format("%.2f %% (%.3f s) of App Time", percentage, time_s)

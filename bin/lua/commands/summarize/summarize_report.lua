@@ -12,7 +12,7 @@ local analyzed_data = {
                                                                                  "(This score doesn't take in consideration async copies hidden by CPU computation.)"},
     {key = "longest_activity",          label = "Longest GPU Activity",   desc = "Longest GPU activity. Can be a kernel, copy operation or a barrier."},
     {key = "total_bytes",               label = "Total bytes transfered", desc = "Total bytes transferred from/to GPU by memory transfers."},
-    {key = "speedup_async_copy",        label = "Perfect HIP Async Copy (Speedup)", desc = "Speed up if all copies were 100% asynchronous"},
+    {key = "speedup_async_copy",        label = "Perfect Async Copy (Speedup)", desc = "Speed up if all copies were 100% asynchronous"},
     {key = "speedup_hidden_copy",       label = "Perfect Hidden Copy (Speedup)",    desc = "Speed up if all copies were hidden by kernels"},
     {key = "speedup_copy_coalescing",   label = "Copy Coalescing (Speedup)",        desc = "Speed up if all coalescable copies were coalesced"},
     {key = "speedup_kernel_coalescing", label = "Kernel Coalescing (Speedup)",      desc = "Speed up if all coalescable kernels were coalesced"}
@@ -37,6 +37,12 @@ function summarize_report.get_analyzed_data(data, opt)
         {id = "omp_target_api_sum"},
         {id = "hip_api_sum"},
         {id = "hsa_api_sum"},
+        {id = "cuda_runtime_sum"},
+        {id = "cuda_driver_sum"},
+        {id = "cuda_sync_sum"},
+        {id = "cublas_api_sum"},
+        {id = "nccl_api_sum"},
+        {id = "nvtx_sum"},
         {id = "gpu_sum"},
         {id = "gpu_kern_sum"},
         {id = "gpu_mem_time_sum"},
@@ -54,7 +60,7 @@ function summarize_report.get_analyzed_data(data, opt)
     }
 
     local options = {
-        ["outputs"]     = {"/tmp/rprof_summarize"},
+        ["outputs"]     = {opt.report_prefix or "/tmp/rprof_summarize"},
         ["formats"]     = {"csv"},
         ["mangled"]     = opt.mangled,
         ["trunc"]       = opt.trunc,

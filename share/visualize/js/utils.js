@@ -6,12 +6,12 @@ function printArgs(obj, indentLevel = 0) {
     const field = obj[key];
     if (typeof field === 'object' && field !== null) {
       if (field.type != undefined && field.value != undefined) {
-        html += `<div class="${indentClass}"><span class="type">${field.type}</span> <span class="key">${key}</span> =  `;
+        html += `<div class="${indentClass}"><span class="type">${escapeHTML(field.type)}</span> <span class="key">${escapeHTML(key)}</span> =  `;
         if (field.value["->*"]) {
           const keys = Object.keys(field.value);
           keys.forEach((subfield, index) => {
             if (index < keys.length - 1) {
-              html += `<span class="value">${field.value[subfield]}</span> -> `;
+              html += `<span class="value">${escapeHTML(field.value[subfield])}</span> -> `;
             } else {
               html += printArgs(field.value[subfield], indentLevel + 1);
             }
@@ -22,10 +22,10 @@ function printArgs(obj, indentLevel = 0) {
           html += printArgs(field.value, indentLevel + 1); 
           html += `</div>}</div>`;
         } else {
-          html += `<span class="value">${field.value}</span></div>`;
+          html += `<span class="value">${escapeHTML(field.value)}</span></div>`;
         }
       } else {
-        html += `<div class="${indentClass}"><span class="key">${key}</span> = {<div class="indent">`;
+        html += `<div class="${indentClass}"><span class="key">${escapeHTML(key)}</span> = {<div class="indent">`;
         html += printArgs(field, indentLevel + 1); 
         html += `</div>}</div>`;
       }

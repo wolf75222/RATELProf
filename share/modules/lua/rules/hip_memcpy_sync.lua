@@ -9,12 +9,13 @@ return function(traces_data, _, opt)
     
     local grouped_copy_by_entry_point = {}
     for _, gpu_trace in pairs(cpy_data) do
-        local entry_trace, domain = traces_data:find_entry_point(gpu_trace)
-        if entry_trace and domain == ratelprof.consts._ENV.DOMAIN_HIP then
+        local entry_trace, api_name = report_helper.get_copy_api(traces_data, gpu_trace)
+        if entry_trace then
             local grouped_trace = grouped_copy_by_entry_point[entry_trace] or {
                 start = math.huge,
                 stop  = 0,
                 size  = 0,
+                name  = api_name,
                 corr_id  = gpu_trace.corr_id,
                 src_type = gpu_trace.args.src_type,
                 dst_type = gpu_trace.args.dst_type
@@ -35,17 +36,17 @@ return function(traces_data, _, opt)
     local nb_api_cpy = 0
     for entry_trace, copy_trace in pairs(grouped_copy_by_entry_point) do
         nb_api_cpy = nb_api_cpy + 1
-        local trace_name = entry_trace.name
+        local trace_name = copy_trace.name
 
-        if trace_name:match("^hipMemcpy") and not trace_name:match("Async$") then
+        if not trace_name:match("Async$") then
             local cpu_dur_ns = entry_trace.dur
-            local gpu_dur_ns = copy_trace.dur
+            local gpu_dur_ns = copy_trace.stop - copy_trace.start
             local tid = tostring(entry_trace.tid)
             local pid = tostring(entry_trace.pid)
 
             local key = tid.."::"..pid
             local total_useless_sync_time = total_useless_sync_time_table[key] or 0
-            total_useless_sync_time_table[key] = total_useless_sync_time + (cpu_dur_ns - gpu_dur_ns)
+            total_useless_sync_time_table[key] = total_useless_sync_time + math.max(0, cpu_dur_ns - gpu_dur_ns)
 
             table.insert(data, {
                 tostring(copy_trace.corr_id),
@@ -71,17 +72,15 @@ return function(traces_data, _, opt)
 
         local max_useless_time = table.max(total_useless_sync_time_table)
 
-        if max_useless_time == nil or max_useless_time == 0 then
-            error("Invalid max ideal duration")
+        if max_useless_time and max_useless_time < app_dur then
+            speedup_factor = app_dur / (app_dur - max_useless_time)
         end
-
-        speedup_factor = app_dur / (app_dur - max_useless_time)
 
         msg = [[ 
 The following are synchronous memory transfers that block the host.
-This correspond to ]]..string.format("%.2f", (((#data)/nb_api_cpy)*100))..[[% of your hipMemcpy*() operations.
+This correspond to ]]..string.format("%.2f", (((#data)/nb_api_cpy)*100))..[[% of the correlated memory copy calls.
 
-Suggestion: Use hipMemcpy*Async() APIs instead.
+Suggestion: Consider the asynchronous copy API and verify that it preserves the application's dependencies.
 Your application might speed up by ]] .. string.format("x%.3f.\n\n", speedup_factor).."\n"
 
         table.sort(data, function(a, b)

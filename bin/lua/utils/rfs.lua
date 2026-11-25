@@ -99,9 +99,9 @@ end
 -- @param dest The destination file path.
 -- @return True if the file was copied successfully, false otherwise.
 function rfs.copy_file(src, dest)
-    local command = string.format('cp "%s" "%s"', src, dest)
-    local success = os.execute(command)
-    return success == 0
+    local quote = ratelprof.utils.shell_quote
+    local command = "cp -- " .. quote(src) .. " " .. quote(dest)
+    return ratelprof.utils.exit_status(os.execute(command)) == 0
 end
 
 -- Gets the base name (file name) from a path
@@ -190,8 +190,8 @@ end
 -- @return True if the path is a directory, false otherwise.
 function rfs.is_dir(p)
     p = get_path(p)
-    local command = 'test -d "' .. p .. '"'
-    return os.execute(command)
+    local command = "test -d " .. ratelprof.utils.shell_quote(p)
+    return ratelprof.utils.exit_status(os.execute(command)) == 0
 end
 
 
@@ -209,8 +209,8 @@ end
 -- @param p The name of the directory to create.
 function rfs.mkdir(p)
     p = get_path(p)
-    local dirname = get_path(p)
-    os.execute('mkdir -p "' .. dirname .. '"')
+    local command = "mkdir -p -- " .. ratelprof.utils.shell_quote(p)
+    return ratelprof.utils.exit_status(os.execute(command)) == 0
 end
 
 --- Checks if a file exists.

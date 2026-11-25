@@ -4,6 +4,9 @@ consts._LUA_PATH     = os.getenv("LUA_PATH") or "."
 consts._INSTALL_DIR  = os.getenv("INSTALL_DIR") or "."
 consts._LIBS_DIR     = consts._INSTALL_DIR.."/lib/"
 consts._MODULES_DIR  = consts._INSTALL_DIR.."/share/modules/"
+local cuda_library = io.open(consts._LIBS_DIR.."libratelprof_cuda.so", "rb")
+consts._BACKEND = cuda_library and "cuda" or "rocm"
+if cuda_library then cuda_library:close() end
 
 
 local major, minor, patch = 1, 1, 0
@@ -76,11 +79,27 @@ consts._DOMAIN_NAME = {
   [consts._ENV.DOMAIN_MPI]          = "MPI API",
 }
 
+local cuda_domains = {
+  CUDA_RUNTIME = "CUDA Runtime API",
+  CUDA_DRIVER = "CUDA Driver API",
+  CUDA_MEMSET = "CUDA Memset",
+  CUDA_SYNC = "CUDA Synchronization",
+  NVTX = "NVTX",
+  CUBLAS = "cuBLAS API",
+  NCCL = "NCCL API",
+}
+
+for domain, name in pairs(cuda_domains) do
+    local key = "RATELPROF_DOMAIN_"..domain
+    consts._ENV["DOMAIN_"..domain] = key
+    consts._DOMAIN_NAME[key] = name
+end
 consts._GPU_DOMAIN = {
   [consts._ENV.DOMAIN_BARRIEROR]    = true,
   [consts._ENV.DOMAIN_BARRIERAND]   = true,
   [consts._ENV.DOMAIN_KERNEL]       = true,
   [consts._ENV.DOMAIN_COPY]         = true,
+  [consts._ENV.DOMAIN_CUDA_MEMSET]  = true,
 }
 
 consts._DOMAIN_DESC = {
@@ -143,6 +162,41 @@ consts._TRACES = {
                           consts._ENV.DOMAIN_BARRIERAND},  name="All Activity"},
   ['none'] =          {var = nil,                          name="No Traces"},
 }
+
+if consts._BACKEND == "cuda" then
+    local E = consts._ENV
+    local traces = consts._TRACES
+    for _, name in ipairs({"hip", "hsa", "hsa-for-rprof", "roctx"}) do
+        traces[name] = nil
+    end
+    traces["cuda-runtime"] = {var=E.DOMAIN_CUDA_RUNTIME, name=cuda_domains.CUDA_RUNTIME}
+    traces["cuda-driver"] = {var=E.DOMAIN_CUDA_DRIVER, name=cuda_domains.CUDA_DRIVER}
+    traces["nvtx"] = {var=E.DOMAIN_NVTX, name=cuda_domains.NVTX}
+    traces["barrier"] = {var=E.DOMAIN_CUDA_SYNC, name=cuda_domains.CUDA_SYNC}
+    traces["memset"] = {var=E.DOMAIN_CUDA_MEMSET, name=cuda_domains.CUDA_MEMSET}
+    traces["cpu"].var = {E.DOMAIN_CUDA_RUNTIME, E.DOMAIN_CUDA_DRIVER, E.DOMAIN_MPI,
+                         E.DOMAIN_OMP_TGT, E.DOMAIN_OMP_TGT_RTL, E.DOMAIN_OMPT}
+    consts._CUDA_LIBRARY_WRAPPERS = {}
+    for _, name in ipairs({"cublas", "nccl"}) do
+        local key = name:upper()
+        local domain = E["DOMAIN_"..key]
+        traces[name] = {var=domain, name=cuda_domains[key]}
+        local library = consts._LIBS_DIR.."libratelprof_cuda_"..name..".so"
+        local file = io.open(library, "rb")
+        if file then
+            file:close()
+            table.insert(traces["cpu"].var, domain)
+            consts._CUDA_LIBRARY_WRAPPERS[domain] = library
+        end
+    end
+    traces["gpu"].var = {E.DOMAIN_KERNEL, E.DOMAIN_COPY, E.DOMAIN_CUDA_MEMSET, E.DOMAIN_CUDA_SYNC}
+    traces["all"].var = {E.DOMAIN_NVTX}
+    for _, group in ipairs({"cpu", "gpu"}) do
+        for _, var in ipairs(traces[group].var) do
+            table.insert(traces["all"].var, var)
+        end
+    end
+end
 
 
 consts._ALL_RULES_REPORT = {
@@ -281,6 +335,48 @@ consts._ALL_STATS_REPORT = {
       omp_target_api_sum = {
         desc    = "Compute statistics about OpenMP Target RTL API traces",
         default = true
+      },
+      cuda_runtime_sum = {
+        desc    = "Summarize CUDA Runtime API calls",
+        default = true
+      },
+      cuda_runtime_trace = {
+        desc    = "List CUDA Runtime API calls",
+      },
+      cuda_driver_sum = {
+        desc    = "Summarize CUDA Driver API calls",
+        default = true
+      },
+      cuda_driver_trace = {
+        desc    = "List CUDA Driver API calls",
+      },
+      cuda_sync_sum = {
+        desc    = "Summarize CUDA synchronization calls",
+        default = true
+      },
+      cuda_sync_trace = {
+        desc    = "List CUDA synchronization calls",
+      },
+      nvtx_sum = {
+        desc    = "Summarize NVTX annotations",
+        default = true
+      },
+      nvtx_trace = {
+        desc    = "List NVTX annotations",
+      },
+      cublas_api_sum = {
+        desc    = "Summarize traced cuBLAS API calls",
+        default = true,
+      },
+      cublas_api_trace = {
+        desc    = "List traced cuBLAS API calls",
+      },
+      nccl_api_sum = {
+        desc    = "Summarize traced NCCL API calls",
+        default = true,
+      },
+      nccl_api_trace = {
+        desc    = "List traced NCCL API calls",
       },
       hip_api_trace = {
         desc    = "Show all trace about HIP API",

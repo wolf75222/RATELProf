@@ -4,6 +4,19 @@ local utils = {}
 
 utils.demangle = require ("demangle").demangle
 
+function utils.shell_quote(value)
+    return "'"..tostring(value):gsub("'", "'\\''").."'"
+end
+
+-- Lua 5.1 and LuaJIT return a POSIX wait status. Newer Lua returns a tuple.
+function utils.exit_status(result, reason, code)
+    if type(result) == "number" then
+        local signal = result % 128
+        return signal == 0 and math.floor(result / 256) or 128 + signal
+    end
+    return result and 0 or (reason == "signal" and 128 + code or code or 1)
+end
+
 function utils.compute_total_covered_duration(...)
     local intervals = {}
     local count = 0
@@ -211,7 +224,7 @@ function utils.get_gpu_id(trace, traces_data)
         else error ("shouldn't reach, a gpu trace need to have a gpu agent")
         end
     end
-    return traces_data:get_gpu_id(gpu_agent)
+    return traces_data:get_gpu_id(gpu_agent, trace.mpi_rank)
 end
 
 
@@ -221,13 +234,13 @@ local function generate_json(value, indent)
     local json_parts = {}
 
     local function escape_string(str)
-        return string.format("%q", str):gsub("\\\n", "\\n") -- Clean up newline
+        return JSON:encode(str)
     end
 
     if type(value) == "string" then
         return escape_string(value)
     elseif type(value) == "number" then
-        return tostring(value)
+        return (value ~= value or math.abs(value) == math.huge) and "null" or tostring(value)
     elseif type(value) == "boolean" then
         return tostring(value)
     elseif type(value) == "nil" then

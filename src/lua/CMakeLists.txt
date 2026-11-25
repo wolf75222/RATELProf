@@ -22,9 +22,14 @@ ADD_LUA_LIBRARY(msgpack_encoder msgpack/msgpack_encoder.c ${MSGPACK_SRC})
 TARGET_INCLUDE_DIRECTORIES(msgpack_encoder PRIVATE ${MSGPACK_DIR})
 
 
-ADD_LUA_LIBRARY(ratelprof_agent_query ratelprof_agent_query.c)
-TARGET_LINK_LIBRARIES(ratelprof_agent_query PRIVATE -lhsa-runtime64)
-TARGET_LINK_DIRECTORIES(ratelprof_agent_query PRIVATE /opt/rocm/lib)
+IF(RATELPROF_BACKEND STREQUAL "rocm")
+    ADD_LUA_LIBRARY(ratelprof_agent_query ratelprof_agent_query.c)
+    TARGET_LINK_LIBRARIES(ratelprof_agent_query PRIVATE -lhsa-runtime64)
+    TARGET_LINK_DIRECTORIES(ratelprof_agent_query PRIVATE /opt/rocm/lib)
+ELSE()
+    ADD_LUA_LIBRARY(ratelprof_cuda_agent ratelprof_cuda_agent.c)
+    TARGET_LINK_LIBRARIES(ratelprof_cuda_agent PRIVATE CUDA::cuda_driver)
+ENDIF()
 
 
 ADD_LUA_LIBRARY(demangle demangle.c)

@@ -10,13 +10,62 @@ local BinaryReport  = require ("utils.Classes.BinaryReport")
 
 local visualize = {}
 
-function visualize.process_visualizing(positional_args, options_values)
-    local data = BinaryReport:new(positional_args)
+local function webgl(data, output, options)
+    local quote = ratelprof.utils.shell_quote
+    local directory = ratelprof.utils.execute_command("mktemp -d")
+    if directory == "" then error("Could not create a temporary WebGL export directory") end
 
-    local output         = ratelprof.get_opt_val(options_values, "output") or data:get_report_basename()
+    local ok, result = pcall(function()
+        options.report_prefix = directory.."/report"
+        local summary = summarize.get_summary(data)
+        local analyzed, statistics, rules = summarize_report.get_analyzed_data(data, options)
+        local payload = {
+            report = data:to_json(),
+            summary = JSON:decode(main_panel.get_summary_data_as_js_string(summary, analyzed)),
+            statistics = statistics[-1] or {},
+            analyze = rules[-1] or {},
+            domains = ratelprof.consts._DOMAIN_NAME,
+            start = tonumber(options.start),
+            stop = tonumber(options.stop),
+        }
+        local input = directory.."/report.json"
+        local file = ratelprof.fs.open_file(input, "w")
+        file:write(ratelprof.utils.generate_json(payload))
+        file:close()
+        local exporter = ratelprof.consts._MODULES_DIR.."webgl/export.py"
+        local command = "python3 "..quote(exporter).." "..quote(input).." "..
+                        quote(options.viewer).." "..quote(output)
+        return ratelprof.utils.exit_status(os.execute(command))
+    end)
+    os.execute("rm -rf -- "..quote(directory))
+    if not ok then error(result, 0) end
+    if result ~= 0 then os.exit(result) end
+    Message:print("RPROF: RATELProf-Visualize report written to "..output.."/index.html")
+end
+
+function visualize.process_visualizing(positional_args, options_values)
+    local data = BinaryReport:new(positional_args, {
+        start = tonumber(options_values.start),
+        stop = tonumber(options_values.stop)
+    })
+
+    local output = ratelprof.get_opt_val(options_values, "output")
+    if not output then
+        output = data:get_report_basename()
+        if ratelprof.fs.exists(output) and not ratelprof.fs.is_dir(output) then
+            output = output.."_visualize"
+        end
+    end
+    if options_values.viewer then
+        webgl(data, output, options_values)
+        return
+    end
     local tmp_dir        = ratelprof.get_opt_val(options_values, "tmp")
     ratelprof.fs.mkdir(tmp_dir)
-    ratelprof.fs.mkdir(output)
+    if not ratelprof.fs.mkdir(output) then
+        Message:error("Could not create visualization directory "..output)
+        os.exit(1)
+    end
 
     local timeline_data = preprocess.start(data, output, options_values)
 
@@ -40,7 +89,7 @@ function visualize.process_visualizing(positional_args, options_values)
     end)
 
     local handlers = {
-        {HANDLE = "HTML_TITLE",             data = '"'..data:get_report_basename()..'"'},
+        {HANDLE = "HTML_TITLE",             data = JSON:encode(data:get_report_basename())},
         {HANDLE = "TIMELINE_LIFECYCLE",     data = JSON:encode(timeline_lifecycle)},
         {HANDLE = "TIMELINE_MAX",           data = data:get_max_stop_time()},
         {HANDLE = "TIMELINE_DATA",          data = timeline_data},
@@ -60,7 +109,10 @@ function visualize.process_visualizing(positional_args, options_values)
     local data_output = ratelprof.fs.concat_path(output, '.data/.data.js')
     local html_output = ratelprof.fs.concat_path(output, ratelprof.fs.basename(output)..'.html')
 
-    ratelprof.fs.copy_file(ratelprof.consts._HTML_REPORT_PATH, html_output)
+    if not ratelprof.fs.copy_file(ratelprof.consts._HTML_REPORT_PATH, html_output) then
+        Message:error("Could not write visualization "..html_output)
+        os.exit(1)
+    end
 
     local file = ratelprof.fs.open_file(data_output, "w")
     file:write(data_content)

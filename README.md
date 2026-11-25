@@ -1,5 +1,109 @@
 # RATELProf
 
+## NVIDIA CUDA backend
+
+This port keeps the report format from RATELProf `master` (`8e71397`) and
+adds selected features from `pre-release`, including the WebGL export and
+CPU/GPU breakdown.
+
+Build the CUDA backend on Linux with CMake 3.18+, LuaJIT or Lua 5.1, and the
+CUDA 12.9, 13.0 or 13.1 toolkit, including CUPTI and the CUDA binary utilities.
+Use a separate install prefix for each backend.
+
+```sh
+cmake -S . -B build-cuda -DRATELPROF_BACKEND=cuda \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local/ratelprof-cuda"
+cmake --build build-cuda --parallel
+cmake --install build-cuda
+export PATH="$HOME/.local/ratelprof-cuda/bin:$PATH"
+```
+
+If several toolkits are installed, pass `-DCUDAToolkit_ROOT=/path/to/cuda` to
+CMake and put that toolkit's `bin` directory on `PATH` for inspection. The
+default build remains ROCm. CMake discovers optional MPI and OMPT headers.
+Set `MPI_C_COMPILER` or `RATELPROF_OMPT_INCLUDE_DIR` if discovery needs a hint.
+MPI tracing uses the same MPI implementation and ABI as the application.
+
+```sh
+ratelprof profile --trace gpu,cuda-runtime,cuda-driver,nvtx -o run.rprof-rep ./application -- --app-option
+ratelprof stats -r gpu_kern_sum,cuda_runtime_sum,cuda_sync_sum run.rprof-rep
+ratelprof breakdown -r gpu_breakdown run.rprof-rep
+ratelprof summarize run.rprof-rep
+ratelprof analyze run.rprof-rep
+ratelprof visualize run.rprof-rep
+ratelprof export --type json run.rprof-rep
+ratelprof export --type arg-info run.rprof-rep
+ratelprof inspect --info gpu
+ratelprof inspect --save-json --sass --sass-summary ./application
+```
+
+- `profile` records CUDA Runtime and Driver calls, concurrent kernels, memory
+  copies, peer copies, memsets, synchronization and NVTX ranges and marks.
+  Kernel launches retain grid dimensions in blocks, block dimensions in
+  threads, registers per thread and shared memory. The CUDA equivalent of
+  `--trace barrier` records CUDA synchronization calls. Choose `--plugin
+  stdout` for text traces.
+- The whitelist and blacklist use the existing format. For example,
+  `CUDA_RUNTIME: cudaMalloc cudaMemcpyAsync` selects those Runtime API calls.
+  CUDA argument export includes return codes and parameters for selected launch,
+  allocation, copy and memset APIs.
+- `inspect` reads kernel resources with `cuobjdump` and uses `nvdisasm` for
+  SASS when available. `cuobjdump --dump-sass` is the fallback. The
+  `RATELPROF_NVDISASM` environment variable can point to a compatible disassembler.
+  `--sass-summary` counts static instructions by kernel and opcode in a
+  `.sass.json` file. The counts describe the binary. Execution frequencies and
+  latencies require runtime measurements. Inspection accepts a CUDA executable,
+  shared library or standalone cubin containing compiled device code. The GPU
+  query follows CUDA device visibility.
+- `--trace mpi` covers common C MPI calls. With
+  `--prefix='mpirun -np 2'`, each rank writes its own `rank_<n>_*.rprof-rep`.
+  Pass those files together to the report commands. `--trace omp` captures common
+  OpenMP target routines, OMPT regions, and target data and submit operations
+  when the OpenMP runtime provides those callbacks.
+- `--trace cublas,nccl` covers common cuBLAS, cuBLASLt and NCCL calls,
+  including GEMM and selected collectives. CMake enables the wrappers when
+  the corresponding headers are available. Use `-DNCCL_ROOT=/path/to/nccl`
+  when NCCL is installed in a separate prefix.
+- `breakdown` reports active time by rank and by PID or GPU. It uses the
+  union of observed event intervals to account for overlapping work and can
+  export the tables as CSV or TSV.
+
+NVIDIA uses its own CUDA Driver and Runtime domains in place of HIP and HSA.
+Custom ROCm plugins, HSA barrier packets, exhaustive API arguments, PC sampling
+and hardware performance counters are outside the current NVIDIA backend.
+The collector profiles the directly launched Linux executable and writes the
+report at normal process exit.
+
+### RATELProf-Visualize WebGL viewer
+
+The built-in HTML viewer is available with `ratelprof visualize`. To generate
+the layout expected by the separate RATELProf-Visualize project, use Python
+3.9 or newer and pass its checkout to `--viewer`.
+
+```sh
+git clone https://github.com/Kassouley/RATELProf-Visualize.git
+ratelprof visualize --viewer ./RATELProf-Visualize -o webgl-report run.rprof-rep
+python3 -m http.server --directory webgl-report 8000
+```
+
+Open `http://localhost:8000`. The export includes the Summary, Timeline,
+Breakdown, Statistics and Analyze views. Pass multiple rank reports to the
+same command to use the rank selector. The viewer loads deck.gl from its
+configured CDN and requires WebGL in the browser. The export was tested with
+RATELProf-Visualize revision `5a2d509`.
+
+### CUDA smoke test
+
+```sh
+nvcc -arch=sm_90 tests/cuda/smoke.cu -ldl -o smoke
+ratelprof profile -t all -o smoke.rprof-rep ./smoke -- "argument with 'quotes' and spaces"
+ratelprof export --type json smoke.rprof-rep
+python3 tests/cuda/verify.py smoke.json
+```
+
+Set the architecture to match the test GPU. The tests also contain separate
+fixtures for peer copies, MPI and OpenMP target offload.
+
 RATELProf is a powerful and lightweight profiler designed specifically for AMD GPU applications. It enables detailed profiling by tracing GPU activities, and runtime API calls from HSA, HIP, and OpenMP. This tool is ideal for developers and researchers aiming to optimize GPU-accelerated applications.
 
 ##  Table of Contents

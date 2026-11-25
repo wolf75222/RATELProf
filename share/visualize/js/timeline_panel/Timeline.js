@@ -478,24 +478,44 @@ class Timeline {
             append(lcol, "End Time",   convertTime(trace.end));
 
             if (domain === "Kernel Dispatch") {
+                const cuda = args.context_id !== undefined;
                 append(lcol, "Dispatch Time",          convertTime(args.dispatch_time));
                 append(rcol, "GPU ID",                 this.values[0]);
-                append(rcol, "Queue ID",               trace.group);
-                append(rcol, "Block Dimension",        `[${Object.values(args.wrg).join(", ")}]`);
-                append(rcol, "Grid Dimension",         `[${Object.values(args.grd).join(", ")}]`);
-                append(rcol, "Private Segment Size",   args.private_segment_size);
-                append(rcol, "Group Segment Size",     args.group_segment_size);
-                append(rcol, "Kernel Handle",          args.kernel_object);
-                append(rcol, "Kernel Arg Addr",        args.kernarg_address);
-                append(rcol, "Completion Signal",      args.sig);
+                append(rcol, cuda ? "CUDA Stream ID" : "Queue ID", trace.group);
+                append(rcol, cuda ? "Block (threads)" : "Block Dimension", `[${Object.values(args.wrg).join(", ")}]`);
+                append(rcol, cuda ? "Grid (blocks)" : "Grid Dimension", `[${Object.values(args.grd).join(", ")}]`);
+                if (cuda) {
+                    append(rcol, "CUDA Context ID",       args.context_id);
+                    append(rcol, "Local Bytes / Thread",  args.private_segment_size);
+                    append(rcol, "Shared Bytes / Block",  args.group_segment_size);
+                    append(rcol, "Registers / Thread",    args.registers_per_thread);
+                } else {
+                    append(rcol, "Private Segment Size",  args.private_segment_size);
+                    append(rcol, "Group Segment Size",    args.group_segment_size);
+                    append(rcol, "Kernel Handle",         args.kernel_object);
+                    append(rcol, "Kernel Arg Addr",       args.kernarg_address);
+                    append(rcol, "Completion Signal",     args.sig);
+                }
 
             } else if (domain === "Memory Transfer") {
+                const cuda = args.context_id !== undefined;
                 append(rcol, "GPU ID",             this.values[0]);
-                append(rcol, "SDMA Engine ID",     trace.group);
+                append(rcol, cuda ? "CUDA Stream ID" : "SDMA Engine ID", trace.group);
                 append(rcol, "Source",             args.src);
                 append(rcol, "Destination",        args.dst);
                 append(rcol, "Size transferred",   convertBytes(args.size));
-                append(rcol, "Completion Signal",  args.sig);
+                if (cuda) {
+                    append(rcol, "CUDA Context ID",    args.context_id);
+                } else {
+                    append(rcol, "Completion Signal", args.sig);
+                }
+
+            } else if (domain === "CUDA Memset") {
+                append(rcol, "GPU ID",             this.values[0]);
+                append(rcol, "CUDA Stream ID",     trace.group);
+                append(rcol, "CUDA Context ID",    args.context_id);
+                append(rcol, "Size initialized",   convertBytes(args.size));
+                append(rcol, "Value",              args.value);
 
             } else if (domain === "Barrier AND" || domain === "Barrier OR") {
                 append(lcol, "Dispatch Time",      convertTime(args.dispatch_time));

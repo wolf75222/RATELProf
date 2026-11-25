@@ -138,6 +138,8 @@ function summarize_plot.get_plot_data(data)
     data:for_each_rank(function (mpi_rank, _)
         local app_time = data:get_app_dur()
         local hip_time = data:compute_total_covered_duration(ratelprof.consts._ENV.DOMAIN_HIP)
+        local cuda_time = data:compute_total_covered_duration(ratelprof.consts._ENV.DOMAIN_CUDA_RUNTIME,
+                                                               ratelprof.consts._ENV.DOMAIN_CUDA_DRIVER)
         local mpi_time = data:compute_total_covered_duration(ratelprof.consts._ENV.DOMAIN_MPI)
         local omp_time = data:compute_total_covered_duration(ratelprof.consts._ENV.DOMAIN_OMP_TGT,
                                                              ratelprof.consts._ENV.DOMAIN_OMP_TGT_RTL,
@@ -147,6 +149,7 @@ function summarize_plot.get_plot_data(data)
             if plot.key == "per_rank_api_time" then
                 entries[string.format(plot.label, mpi_rank)] = compute_percentages(app_time, {
                                                                     ["HIP API"] = hip_time,
+                                                                    ["CUDA API"] = cuda_time,
                                                                     ["MPI API"] = mpi_time,
                                                                     ["OMP API"] = omp_time
                                                                 })

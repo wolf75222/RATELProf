@@ -9,6 +9,7 @@ local function get_output_data(traces_data, opt)
     local barrand_traces = traces_data:get(ratelprof.consts._ENV.DOMAIN_BARRIERAND, opt)
     local kern_traces    = traces_data:get(ratelprof.consts._ENV.DOMAIN_KERNEL, opt)
     local mem_traces     = traces_data:get(ratelprof.consts._ENV.DOMAIN_COPY, opt)
+    local memset_traces  = traces_data:get(ratelprof.consts._ENV.DOMAIN_CUDA_MEMSET, opt)
 
     -- Helper function to construct entries
     local function add_entry(trace, id, entry_type)
@@ -41,7 +42,7 @@ local function get_output_data(traces_data, opt)
                 tostring(trace.corr_id),
                 "---", "---", "---", "---", "---", "---", "---", "---",
                 "---", "---", "---", "---",
-                traces_data:get_gpu_id(trace.args.gpu_id),
+                traces_data:get_gpu_id(trace.args.gpu_id, trace.mpi_rank),
                 tostring(trace.args.queue_id),
                 entry_type == 2 and "Barrier And" or "Barrier Or"
             }
@@ -57,9 +58,20 @@ local function get_output_data(traces_data, opt)
                 trace.args.group_segment_size,
                 trace.args.private_segment_size,
                 "---", "---", "---", "---",
-                traces_data:get_gpu_id(trace.args.gpu_id),
+                traces_data:get_gpu_id(trace.args.gpu_id, trace.mpi_rank),
                 tostring(trace.args.queue_id),
                 ratelprof.utils.get_kernel_name(trace.args.kernel_name, opt.trunc, opt.mangled)
+            }
+        else
+            local size = tonumber(convert.bytes(trace.args.size, "bytes", "mb"))
+            return {
+                string.format("%.0f", trace.start), dur, "---",
+                tostring(id), tostring(trace.corr_id),
+                "---", "---", "---", "---", "---", "---", "---", "---",
+                size, dur > 0 and size / convert.time(dur, timeunit, "sec") or "---",
+                "---", "Device",
+                traces_data:get_gpu_id(trace.args.gpu_id, trace.mpi_rank),
+                tostring(trace.args.queue_id), "CUDA memset"
             }
         end
     end
@@ -79,6 +91,10 @@ local function get_output_data(traces_data, opt)
 
     for id, trace in pairs(kern_traces) do
         table.insert(data, add_entry(trace, id, 3))
+    end
+
+    for id, trace in pairs(memset_traces) do
+        table.insert(data, add_entry(trace, id, 4))
     end
 
     return data

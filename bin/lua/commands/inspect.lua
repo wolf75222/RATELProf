@@ -64,6 +64,11 @@ local function inspect_agents()
 end
 
 function inspect.process_inspecting(positional_args, opt)
+    if ratelprof.consts._BACKEND == "cuda" then
+        local cuda = require("commands.inspect.cuda")
+        if opt.info == "gpu" then return cuda.gpus() end
+        if opt.info == "kernels" then return cuda.kernels(positional_args[1], opt) end
+    end
 
     if ratelprof.get_opt_val(opt, "info") == "gpu" then
         inspect_agents()

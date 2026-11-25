@@ -1,4 +1,5 @@
 local consts_helper = {}
+local cuda = ratelprof.consts._BACKEND == "cuda"
 
 local trace_list = {}
 for k, _ in pairs(ratelprof.consts._TRACES) do
@@ -34,7 +35,7 @@ end
 
 
 consts_helper.profile = {
-    desc = "\n\tProfile an AMD GPU application and trace AMD Library functions",
+    desc = "\n\tProfile a GPU application with the selected backend.",
     opt = {
         output = {
             desc            = "Output report filename.",
@@ -56,11 +57,12 @@ consts_helper.profile = {
             arg_required    = true,
         },
         plugin = {
-            desc            = "Specify the plugin path for RATELProf (options: msgpack, stdout, or custom path)",
+            desc            = cuda and "Select the output plugin (msgpack or stdout)." or
+                              "Specify the plugin path for RATELProf (options: msgpack, stdout, or custom path)",
             sname           = nil,
             arg             = "<PLUGIN>",
             arg_required    = true,
-            default         = ratelprof.consts._DEFAULT_PLUGIN
+            default         = cuda and "msgpack" or ratelprof.consts._DEFAULT_PLUGIN
         },
         trace = {
             desc            = string.format([[ 
@@ -68,15 +70,14 @@ consts_helper.profile = {
                 Possible values are %s.
                 Select the API(s) to trace. Multiple APIs can be selected, separated by commas only (no spaces).
                 If 'none' is selected, no API is traced.
-                'gpu' is equivalent to 'kernel,memory,barrier'.
-                'cpu' is equivalent to all other APIs.
+                'gpu' selects kernel, memory and synchronization activities.
+                'cpu' selects host APIs.
                 'omp' is equivalent to 'omp-routine,omp-region,omp-tgt-rtl'.
-                'all' is equivalent to 'cpu,gpu'.
-                Default is 'kernel,memory,hip'.]], "'" .. table.concat(trace_list, "', '") .. "'"),
+                'all' includes the available host, GPU and annotation domains.]], "'" .. table.concat(trace_list, "', '") .. "'"),
             sname           = "t",
             arg             = "<API>[,<API>]",
             arg_required    = true,
-            default         = "kernel,memory,hip"
+            default         = cuda and "kernel,memory,cuda-runtime" or "kernel,memory,hip"
         },
         ['log-level'] = {
             desc            = [[ 
@@ -354,7 +355,7 @@ consts_helper.inspect = {
             is_list = false
         }
     },
-    desc = "\n\tInspect an AMD GPU application and output data about kernels from the application.",
+    desc = "\n\tInspect GPU properties or kernel resources in an application binary.",
     opt = {
         info = {
             desc            = [[
@@ -374,6 +375,14 @@ consts_helper.inspect = {
             arg_required    = false,
             default         = nil
         },
+        sass = cuda and {
+            desc = "Save CUDA machine code alongside the CSV.",
+            arg_required = false,
+        } or nil,
+        ['sass-summary'] = cuda and {
+            desc = "Count static SASS instructions by opcode and kernel.",
+            arg_required = false,
+        } or nil,
         output = {
             desc            = [[ 
                 Change the CSV output file.]],
@@ -405,13 +414,18 @@ consts_helper.visualize = {
     cmd = "visualize",
     args = {
         ["report"] = {
-            desc = "Path to the report file to visualize.",
+            desc = "Path(s) to the report files to visualize.",
             is_optional = false,
-            is_list = false
+            is_list = true
         }
     },
     desc = "\n\tGenerate a HTML report view to see traces as a timeline.",
     opt = {
+        viewer = {
+            desc = "Generate a WebGL report using a RATELProf-Visualize checkout.",
+            arg = "<DIR>",
+            arg_required = true,
+        },
         tmp = {
             desc            = [[ 
                 Specify a temp directory to save CSV statistics output (default: /tmp)]],

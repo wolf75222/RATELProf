@@ -172,13 +172,18 @@ function Script:check_args(args)
                 break
             end
             for _, option in ipairs(self.options) do
-                if (option.short_name and arg == "-" .. option.short_name) 
-                    or (option.long_name and arg:match("^%-%-" .. option.long_name:gsub("-", "%%-") .. "=?")) then
+                local long_name = option.long_name and "--" .. option.long_name
+                local inline
+                if long_name and arg:sub(1, #long_name + 1) == long_name .. "=" then
+                    inline = arg:sub(#long_name + 2)
+                end
+                if (option.short_name and arg == "-" .. option.short_name)
+                    or (long_name and (arg == long_name or inline ~= nil)) then
                     matched_option = true
                     option.has_been_processed = true
                     if option.arg and option.need_arg then
-                        if option.long_name and arg:match("=(.+)") then
-                            value = arg:match("^%-%-" .. option.long_name .. "=(.+)")
+                        if inline ~= nil then
+                            value = inline
                         else
                             i = i + 1
                             value = args[i]
@@ -199,8 +204,8 @@ function Script:check_args(args)
                             end
                         end
                     elseif option.arg and not option.need_arg then
-                        if option.long_name and arg:match("=(.+)") then
-                            value = arg:match("^%-%-" .. option.long_name .. "=(.*)")
+                        if inline ~= nil then
+                            value = inline
                         else
                             i = i + 1
                             value = args[i]

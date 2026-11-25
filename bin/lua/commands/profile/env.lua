@@ -7,7 +7,7 @@ env.env_value = {}
 -- Function to set environment variable
 function env.set_env(var, value)
     if not var then return end
-    table.insert(env.env_value, var.."="..value)
+    table.insert(env.env_value, ratelprof.utils.shell_quote(var.."="..value))
 end
 
 function env.get_env()

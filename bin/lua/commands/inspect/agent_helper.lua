@@ -1,5 +1,3 @@
-local ratelprof_agent_query = require("ratelprof_agent_query")
-
 local agent_helper = {}
 
 -- Pretty helper to format numbers with hex
@@ -54,7 +52,9 @@ local useful_info = {
 
 agent_helper.useful_info = useful_info
 
-agent_helper.get_agents = ratelprof_agent_query.get_agents
+function agent_helper.get_agents()
+    return require("ratelprof_agent_query").get_agents()
+end
 
 function agent_helper.print_gpu_data()
     local agents, _ = agent_helper.get_agents()
@@ -86,6 +86,18 @@ end
 function agent_helper.get_gpu_props(agents)
     if not agents then
         agents, _ = agent_helper.get_agents()
+    end
+    for _, agent in pairs(agents) do
+        if agent.backend == "cuda" then
+            local labels = {"Name", "CUDA ordinal", "UUID", "Compute capability",
+                            "Streaming multiprocessors", "Warp size", "Global memory (bytes)"}
+            local props = {}
+            for node, gpu in pairs(agents) do
+                props[tostring(node)] = {gpu.name, gpu.ordinal, gpu.uuid, gpu.arch,
+                                         gpu.cu_count, gpu.wavefront_size, gpu.global_memory}
+            end
+            return labels, props
+        end
     end
     local gpu_props = {}
 

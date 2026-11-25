@@ -15,13 +15,14 @@ return function(traces_data, _, opt)
 
     local grouped_copy_by_entry_point = {}
     for _, gpu_trace in pairs(cpy_data) do
-        local entry_trace, domain = traces_data:find_entry_point(gpu_trace)
+        local entry_trace, api_name = report_helper.get_copy_api(traces_data, gpu_trace)
 
-        if entry_trace and domain == ratelprof.consts._ENV.DOMAIN_HIP then
+        if entry_trace then
             local grouped_trace = grouped_copy_by_entry_point[entry_trace] or {
                 start = math.huge,
                 stop  = 0,
                 size  = 0,
+                name  = api_name,
                 corr_id  = gpu_trace.corr_id,
                 src_type = gpu_trace.args.src_type,
                 dst_type = gpu_trace.args.dst_type
@@ -42,9 +43,9 @@ return function(traces_data, _, opt)
     local nb_api_cpy = 0
     for entry_trace, copy_trace in pairs(grouped_copy_by_entry_point) do
         nb_api_cpy = nb_api_cpy + 1
-        local trace_name = entry_trace.name
+        local trace_name = copy_trace.name
 
-        if trace_name:match("^hipMemcpy[%w_]*Async$") then
+        if trace_name:match("Async$") then
             if is_synchronized(copy_trace, entry_trace) then
                 local gpu_dur_ns = copy_trace.stop - copy_trace.start
                 local cpu_dur_ns = entry_trace.dur
@@ -54,7 +55,7 @@ return function(traces_data, _, opt)
 
                 local key = tid.."::"..pid
                 local total_useless_sync_time = total_useless_sync_time_table[key] or 0
-                total_useless_sync_time_table[key] = total_useless_sync_time + (cpu_dur_ns - gpu_dur_ns)
+                total_useless_sync_time_table[key] = total_useless_sync_time + math.max(0, cpu_dur_ns - gpu_dur_ns)
 
                 table.insert(data, {
                     tostring(copy_trace.corr_id),
@@ -81,19 +82,16 @@ return function(traces_data, _, opt)
 
         local max_useless_time = table.max(total_useless_sync_time_table)
 
-        if max_useless_time == nil or max_useless_time == 0 then
-            error("Invalid max ideal duration")
+        if max_useless_time and max_useless_time < app_dur then
+            speedup_factor = app_dur / (app_dur - max_useless_time)
         end
 
-        speedup_factor = app_dur / (app_dur - max_useless_time)
-
         msg = [[ 
-The following memory transfers are synchronized with their corresponding HIP asynchronous memory copy trace.
-It appears that the transferred memory is either using PAGEABLE memory or is not large enough to be processed asynchronously.
+The following transfers started and completed during the corresponding asynchronous host calls.
 
-This correspond to ]]..string.format("%.2f", (((#data)/nb_api_cpy)*100))..[[% of your hipMemcpy*Async operations.
+This correspond to ]]..string.format("%.2f", (((#data)/nb_api_cpy)*100))..[[% of the correlated memory copy calls.
 
-Suggestion: If applicable, use PINNED memory instead by using hipHostMalloc to allocate your host side memory.
+Suggestion: Check whether host memory is pinned for the affected transfers.
 Your application might speed up by ]] .. string.format("x%.3f.\n\n", speedup_factor).."\n"
 
 

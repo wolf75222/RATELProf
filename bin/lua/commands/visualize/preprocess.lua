@@ -27,12 +27,17 @@ local function get_kernel_name(name, opt)
 end
 
 
-local function get_last_label(domain_id)
+local function get_last_label(domain_id, is_cuda)
+    if is_cuda and ratelprof.consts._GPU_DOMAIN[domain_id] then
+        return '"CUDA stream ID"'
+    end
     local last_label = "N/A"
     if ratelprof.consts._ENV.DOMAIN_KERNEL     == domain_id or
        ratelprof.consts._ENV.DOMAIN_BARRIEROR  == domain_id or
        ratelprof.consts._ENV.DOMAIN_BARRIERAND == domain_id then
         last_label = '"Queue ID"'
+    elseif ratelprof.consts._ENV.DOMAIN_CUDA_MEMSET == domain_id then
+        last_label = '"CUDA stream ID"'
     elseif ratelprof.consts._ENV.DOMAIN_COPY == domain_id then
         last_label = '"SDMA ID"'
     else
@@ -51,7 +56,7 @@ local function get_event_data(data, event, domain_id, opt)
     if ratelprof.consts._ENV.DOMAIN_KERNEL == domain_id then
         event_content  = get_kernel_name(event.args.kernel_name, opt)
 
-        first_value               = data:get_gpu_id(event.args.gpu_id)
+        first_value               = data:get_gpu_id(event.args.gpu_id, event.mpi_rank)
         group                     = event.args.queue_id
         args.dispatch_time        = event.args.dispatch_time
         args.wrg                  = event.args.wrg
@@ -61,11 +66,20 @@ local function get_event_data(data, event, domain_id, opt)
         args.kernel_object        = event.args.kernel_object
         args.kernarg_address      = event.args.kernarg_address
         args.sig                  = event.sig
+        args.context_id           = event.args.context_id
+        args.grid_unit            = event.args.grid_unit
+        args.registers_per_thread = event.args.registers_per_thread
+        args.graph_node           = event.args.graph_node
 
+    elseif ratelprof.consts._ENV.DOMAIN_CUDA_MEMSET == domain_id then
+        event_content = "CUDA memset"
+        first_value = data:get_gpu_id(event.args.gpu_id, event.mpi_rank)
+        group = event.args.queue_id
+        args = event.args
     elseif ratelprof.consts._ENV.DOMAIN_BARRIEROR == domain_id then
         event_content  = "Barrier OR"
 
-        first_value         = data:get_gpu_id(event.args.gpu_id)
+        first_value         = data:get_gpu_id(event.args.gpu_id, event.mpi_rank)
         group               = event.args.queue_id
         args.dispatch_time  = event.args.dispatch_time
         args.dep_signal     = event.args.dep_signal
@@ -74,7 +88,7 @@ local function get_event_data(data, event, domain_id, opt)
     elseif ratelprof.consts._ENV.DOMAIN_BARRIERAND == domain_id then
         event_content  = "Barrier AND"
 
-        first_value         = data:get_gpu_id(event.args.gpu_id)
+        first_value         = data:get_gpu_id(event.args.gpu_id, event.mpi_rank)
         group               = event.args.queue_id
         args.dispatch_time  = event.args.dispatch_time
         args.dep_signal     = event.args.dep_signal
@@ -85,8 +99,8 @@ local function get_event_data(data, event, domain_id, opt)
 
         local src_agent = event.args.src_agent
         local dst_agent = event.args.dst_agent
-        local src_node  = data:get_gpu_id(src_agent)
-        local dst_node  = data:get_gpu_id(dst_agent)
+        local src_node  = data:get_gpu_id(src_agent, event.mpi_rank)
+        local dst_node  = data:get_gpu_id(dst_agent, event.mpi_rank)
         first_value     = data:node_is_gpu(src_node) and src_node or dst_node
         group = event.args.engine_id
 
@@ -96,6 +110,7 @@ local function get_event_data(data, event, domain_id, opt)
             " Node ID. "..dst_node.." ("..dst_agent..")"
         args.size       = event.args.size
         args.sig        = event.sig
+        args.context_id = event.args.context_id
 
     else
         event_content   = event.name
@@ -176,16 +191,8 @@ function preprocess.start(traces_data, output, opt)
     local files_per_bucket = {}
 
     local timeline_id = 0
-    local nb_timeline = 0
-
-    traces_data:for_each_domain(function(_, _, _, _, _)
-        nb_timeline = nb_timeline + 1
-    end)
-
-    traces_data:for_each_domain(function(domain_name, domain_id, mpi_rank, events, is_gpu_domain)
+    local function write_timeline(domain_name, domain_id, mpi_rank, events, is_gpu_domain, first_value)
         local stack_per_group = {}
-
-        local first_value   = nil
         local raw_data      = traces_data:get_raw(domain_id, mpi_rank)
 
         local current_bucket = 0
@@ -239,13 +246,11 @@ function preprocess.start(traces_data, output, opt)
         local density = init_density(0)
 
         local old_value = 0 
-        for _, event in ipairs(events) do
+        for _, item in ipairs(events) do
+            local event, data = item.event, item.data
             
             old_value = ratelprof.utils.print_mem_usage("", old_value)
 
-            local data = get_event_data(traces_data, event, domain_id, opt)
-
-            first_value = data.first_value
             local group = data.group
 
             -- advance bucket if event.start is outside current range
@@ -293,11 +298,12 @@ function preprocess.start(traces_data, output, opt)
         flush_bucket()
 
         local first_label = is_gpu_domain and "GPU" or "PID"
-        local last_label  = get_last_label(domain_id)
+        local last_label  = get_last_label(domain_id, events[1].event.args and
+                                              events[1].event.args.context_id ~= nil)
         local json_string = "{" ..
             'timeline_id:'..timeline_id..','..
             'rank:'..mpi_rank..','..
-            first_label..':'..first_value..','..
+            first_label..':'..JSON:encode(first_value)..','..
             'Domain:"'..domain_name..'",'..
             last_label..':['..table.concat_keys(stack_per_group, ",")..'],'..
             'density'..':['..table.concat(density, ",")..'],'..
@@ -310,6 +316,23 @@ function preprocess.start(traces_data, output, opt)
         end
 
         timeline_id = timeline_id + 1
+    end
+
+    traces_data:for_each_domain(function(domain_name, domain_id, mpi_rank, events, is_gpu_domain)
+        local lanes = {}
+        for _, event in ipairs(events) do
+            local data = get_event_data(traces_data, event, domain_id, opt)
+            local value = data.first_value
+            local lane = lanes[value]
+            if not lane then
+                lane = {}
+                lanes[value] = lane
+            end
+            lane[#lane + 1] = {event = event, data = data}
+        end
+        for value, lane in pairs(lanes) do
+            write_timeline(domain_name, domain_id, mpi_rank, lane, is_gpu_domain, value)
+        end
     end)
 
     for _, f in pairs(files_per_bucket) do

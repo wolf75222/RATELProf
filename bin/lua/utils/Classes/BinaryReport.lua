@@ -56,6 +56,36 @@ local function decode_rprof(rprof_rep)
     return data
 end
 
+local function merge_cuda_nodes(report, rank_data)
+    local by_uuid, next_node = {}, 1
+    for _, item in ipairs(rank_data) do
+        local local_to_global = {}
+        local nodes = {}
+        for node in pairs(item.props) do nodes[#nodes + 1] = node end
+        table.sort(nodes)
+        for _, local_node in ipairs(nodes) do
+            local gpu = item.props[local_node]
+            local node = by_uuid[gpu.uuid]
+            if not node then
+                while report.gpu_props[next_node] do next_node = next_node + 1 end
+                node, next_node = next_node, next_node + 1
+                if gpu.uuid and gpu.uuid ~= "" then by_uuid[gpu.uuid] = node end
+                gpu.node = node
+                report.gpu_props[node] = gpu
+            end
+            local_to_global[local_node] = node
+        end
+        local map = {}
+        for handle, node in pairs(item.nodes) do
+            map[handle] = local_to_global[node] or node
+        end
+        report.cuda_node_id_by_rank[item.rank] = map
+    end
+    if #rank_data == 1 and report.rank_count == 1 then
+        report.node_id = report.cuda_node_id_by_rank[rank_data[1].rank]
+    end
+end
+
 function BinaryReport:new(rprof_rep_files, opt)
     local self = setmetatable({}, BinaryReport)
 
@@ -80,6 +110,8 @@ function BinaryReport:new(rprof_rep_files, opt)
     self.locations = {}
     self.gpu_props = {}
     self.node_id = {}
+    self.cuda_node_id_by_rank = {}
+    local cuda_rank_data = {}
 
     self.rank_count = #rprof_rep_files
 
@@ -104,11 +136,17 @@ function BinaryReport:new(rprof_rep_files, opt)
         self.lifecycle[mpi_rank]        = data.lifecycle    or error("Missing lifecycle data in report file: " .. rprof_rep_file)
 
         self.locations = table.merge_map(self.locations, data.locations)
-        self.gpu_props = table.merge_map(self.gpu_props, data.gpu_props)
-        self.node_id   = table.merge_map(self.node_id,   data.node_id)
+        local _, gpu = next(data.gpu_props)
+        if gpu and gpu.backend == "cuda" then
+            cuda_rank_data[#cuda_rank_data + 1] = {rank = mpi_rank, props = data.gpu_props, nodes = data.node_id}
+        else
+            table.merge_map(self.gpu_props, data.gpu_props)
+            table.merge_map(self.node_id, data.node_id)
+        end
     end
 
 
+    merge_cuda_nodes(self, cuda_rank_data)
     self.__cached_trace = {}
     return self
 end
@@ -122,6 +160,7 @@ function BinaryReport:to_json()
         lifecycle              = self.lifecycle,
         locations              = self.locations,
         node_id                = self.node_id,
+        cuda_node_id_by_rank   = next(self.cuda_node_id_by_rank) and self.cuda_node_id_by_rank or nil,
         gpu_props              = self.gpu_props,
     }
 end
@@ -211,7 +250,7 @@ end
 
 function BinaryReport:for_each_gpu(func)
     self.__in_for_each_gpu = true
-    for _, gpu_props in ipairs(self.gpu_props) do
+    for _, gpu_props in pairs(self.gpu_props) do
         local gpu_node_id = gpu_props["node"]
         self.__current_gpu = gpu_node_id
         local stop = func(gpu_node_id, gpu_props)
@@ -246,7 +285,7 @@ function BinaryReport:__get(ret, trace_events, mpi_rank, cond_func)
         return ret
     end
     for id, trace in pairs(trace_events) do
-        if (not is_only_main or trace.phase == "MAIN_PHASE") and cond_func(self, trace) then
+        if (not is_only_main or trace.phase == "MAIN_PHASE") and cond_func(self, trace, mpi_rank) then
             local start = trace.start
             local stop  = trace.start + trace.dur
             local within_start = not opt_start or start >= opt_start
@@ -267,17 +306,14 @@ function BinaryReport:__get_for_gpu(domain)
 
     local cond_func = nil
 
-    if domain == ratelprof.consts._ENV.DOMAIN_KERNEL then
-        cond_func = function(obj, trace)
-            return obj:get_gpu_id(trace.args.gpu_id) == obj.__current_gpu
+    if domain == ratelprof.consts._ENV.DOMAIN_KERNEL or domain == ratelprof.consts._ENV.DOMAIN_CUDA_MEMSET then
+        cond_func = function(obj, trace, rank)
+            return obj:get_gpu_id(trace.args.gpu_id, rank) == obj.__current_gpu
         end
     elseif domain == ratelprof.consts._ENV.DOMAIN_COPY then
-        cond_func = function(obj, trace)
-            if trace.args.src_type == 1 then
-                return obj:get_gpu_id(trace.args.src_agent) == obj.__current_gpu
-            elseif trace.args.dst_type == 1 then
-                return obj:get_gpu_id(trace.args.dst_agent) == obj.__current_gpu
-            end
+        cond_func = function(obj, trace, rank)
+            return (trace.args.src_type == 1 and obj:get_gpu_id(trace.args.src_agent, rank) == obj.__current_gpu)
+                or (trace.args.dst_type == 1 and obj:get_gpu_id(trace.args.dst_agent, rank) == obj.__current_gpu)
         end
     else
         error("Using get(domain) method inside for_each_gpu() is only available for GPU domain")
@@ -336,7 +372,13 @@ end
 function BinaryReport:get_location_str(trace)
     local loc = self:get_location(trace)
     if not loc then return "Unknown Location" end
-    return string.format("%s in %s:%d", loc.sfun, loc.sfile, loc.sline)
+    if loc.sfile and loc.sline then
+        return string.format("%s in %s:%d", loc.sfun, loc.sfile, loc.sline)
+    end
+    if loc.offset then
+        return string.format("%s in %s + 0x%x", loc.sfun, loc.ofile, loc.offset)
+    end
+    return string.format("%s in %s", loc.sfun, loc.source or loc.ofile)
 end
 
 
@@ -381,8 +423,9 @@ function BinaryReport:find_entry_point(trace)
     return entry_point, entry_point_domain
 end
 
-function BinaryReport:get_gpu_id(handle)
-    return self.node_id[handle] or string.format('Unknown (%lu)', handle)
+function BinaryReport:get_gpu_id(handle, rank)
+    local map = self.cuda_node_id_by_rank[rank or self._current_rank] or self.node_id
+    return map[handle] or string.format('Unknown (%lu)', handle)
 end
 
 
@@ -437,28 +480,23 @@ function BinaryReport:get_app_dur(rank)
 end
 
 function BinaryReport:get_active_compute_time()
-    if self.cached_active_compute_time then return self.cached_active_compute_time end
-    self.cached_active_compute_time = self:compute_total_covered_duration(ratelprof.consts._ENV.DOMAIN_KERNEL)
-    return self.cached_active_compute_time
+    return self:compute_total_covered_duration(ratelprof.consts._ENV.DOMAIN_KERNEL)
 end
 
 
 function BinaryReport:get_active_copy_time()
-    if self.cached_active_copy_time then return self.cached_active_copy_time end
-    self.cached_active_copy_time = self:compute_total_covered_duration(ratelprof.consts._ENV.DOMAIN_COPY)
-    return self.cached_active_copy_time
+    return self:compute_total_covered_duration(ratelprof.consts._ENV.DOMAIN_COPY)
 end
 
 function BinaryReport:get_active_gpu_time()
-    if self.cached_active_gpu_time then return self.cached_active_gpu_time end
-    self.cached_active_gpu_time = self:compute_total_covered_duration(ratelprof.consts._ENV.DOMAIN_KERNEL, ratelprof.consts._ENV.DOMAIN_COPY)
-    return self.cached_active_gpu_time
+    local E = ratelprof.consts._ENV
+    return self:compute_total_covered_duration(E.DOMAIN_KERNEL, E.DOMAIN_COPY, E.DOMAIN_CUDA_MEMSET)
 end
 
 function BinaryReport:get_not_hidden_active_copy_time()
-    local active_gpu_time = self:get_active_gpu_time()
-    local active_compute_time = self:get_active_compute_time()
-    return active_gpu_time - active_compute_time
+    local E = ratelprof.consts._ENV
+    local active_kernel_or_copy = self:compute_total_covered_duration(E.DOMAIN_KERNEL, E.DOMAIN_COPY)
+    return active_kernel_or_copy - self:get_active_compute_time()
 end
 
 function BinaryReport:compute_total_covered_duration(...)
